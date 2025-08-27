@@ -1,0 +1,77 @@
+@startuml
+title Diagramme de classes – Profiles • Blocks • Hits • Famille (strings only)
+
+class Profile {
+  +id: String
+  +customerRef: String
+  +createdAt: OffsetDateTime
+}
+
+class Block {
+  +id: String
+
+  +profile: Profile
+}
+
+class BlockVersion {
+  +id: String
+  +kind: String            ' ex: "STATIC_DATA", "DOCUMENTS", "KYC" ...
+  +versionNo: int
+  +validFrom: OffsetDateTime
+  +validTo: OffsetDateTime?
+  +status: String          ' ex: "IN_REVIEW", "APPROVED", "REJECTED"
+  +validatedAt: OffsetDateTime?
+  +dataJson: String
+}
+
+class CurrentBlockV {
+  +blockId: String
+  +blockVersionId: String
+  +versionNo: int
+  +kind: String
+  +effectiveFrom: OffsetDateTime
+}
+
+class Hit {
+  +id: String
+  +profile: Profile
+  +hitType: String
+  +severity: String
+  +payloadJson: String
+  +hashKey: String
+  +occurredAt: OffsetDateTime
+  +status: String           ' ex: "OPEN", "LINKED", "RESOLVED" ...
+  +masterHitId: String?
+}
+
+class HitBlockLink {
+  +hitId: String
+  +blockId: String
+  +blockVersionId: String?
+  +linkedAt: OffsetDateTime
+}
+
+class ProfileFamilyLink {
+  +id: String
+  +pivot: Profile
+  +member: Profile
+  +relationType: String     ' ex: "CO_HOLDER", "MANDATAIRE" ...
+  +validFrom: OffsetDateTime
+  +validTo: OffsetDateTime?
+  +remediationStatus: String ' ex: "PENDING", "COMPLETED" ...
+  +lastEvaluatedAt: OffsetDateTime?
+  +comment: String?
+}
+
+'==== Associations ====
+Profile "1" o-- "0..*" BlockVersion
+CurrentBlockV ..> BlockVersion : <<derive (valid_to IS NULL)>>
+
+Profile "1" o-- "0..*" Hit
+Hit   "1" o-- "0..*" HitBlockLink
+Block "1" o-- "0..*" HitBlockLink
+BlockVersion "1" o-- "0..*" HitBlockLink : optional
+
+Profile "1" o-- "0..*" ProfileFamilyLink : as pivot
+Profile "1" o-- "0..*" ProfileFamilyLink : as member
+@enduml
