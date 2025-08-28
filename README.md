@@ -1,79 +1,116 @@
+
 @startuml
-class Review {
-  +UUID id
-  +ReviewScope scope  // PIVOT | FAMILY | MIXED
-  +ReviewStatus status
-  +LocalDateTime createdAt
-  +LocalDateTime closedAt
-  +UUID pivotId      // Customer id
+title Class Diagram – Party • KycReviewBlock (SCD2) • Hits • Relations • ReviewProcess • Audit (strings)
+
+'===== CORE =====
+class Party {
+  +id: String
+  +status: String
+  +type: String
+  +subType: String
+  +relationsKycReviewStatus: String
+  +kycReviewStatus: String
+  +createdAt: OffsetDateTime
+  +updatedAt: OffsetDateTime
 }
 
-class ReviewSubject {
-  +UUID id
-  +UUID reviewId
-  +SubjectRole role  // PIVOT | MEMBER | ATTORNEY
-  +UUID customerId
+class KycReviewBlock {
+  +id: String
+  +blockId: String          ' logical block identity (per party+kind)
+  +partyId: String
+  +kind: String             ' e.g. STATIC_DATA, DOCUMENTS, KYC, KYT, SCREENING
+  +versionNo: int
+  +validFrom: OffsetDateTime
+  +validTo: OffsetDateTime?
+  +status: String           ' IN_REVIEW / APPROVED / REJECTED
+  +validatedAt: OffsetDateTime?
+  +lastValidationDate: OffsetDateTime?
+  +changedBy: String
+  +changeReason: String
+  +dataJson: String
 }
 
-abstract class BlockInstance {
-  +UUID id
-  +BlockStatus status
-  +Validity(validFrom, validTo?)
-  +UUID subjectId   // ReviewSubject
-  +Fingerprint fp   // pour déduplication
-  +UUID sourceReviewId  // si réutilisé
+' Vue (ou vue matérialisée) des versions courantes
+class <<View>> CurrentKycBlockV {
+  +blockId: String
+  +kycReviewBlockId: String
+  +partyId: String
+  +kind: String
+  +versionNo: int
+  +effectiveFrom: OffsetDateTime
+  ..note..
+  Derived from KycReviewBlock where validTo IS NULL.
+  Peut être une vue matérialisée en Oracle (FAST ON COMMIT).
+  ..end note..
 }
 
-class StaticDataBlock {
-  // champs spécifiques static data
-}
-class DocumentBlock {
-  // champs spécifiques document
-}
-class KYTBlock {
-  // champs spécifiques KYT
-}
-class NameScreeningBlock {
-  +LocalDateTime screeningDate
-  +LocalDateTime validUntil
-}
-
-BlockInstance <|-- StaticDataBlock
-BlockInstance <|-- DocumentBlock
-BlockInstance <|-- KYTBlock
-BlockInstance <|-- NameScreeningBlock
-
-class KycProfile {
-  +UUID id
-  +UUID customerId
-  +LocalDateTime generatedAt
-  +ProfileStatus status  // CURRENT | ARCHIVED
-  +updateBlock(newBlockId: UUID)
+'===== HITS & REVIEW PROCESS =====
+class Hit {
+  +id: String
+  +partyId: String          ' lien explicite Party → Hit
+  +type: String             ' e.g. SANCTION, PEP, KYT_RULE
+  +severity: String         ' LOW/MED/HIGH
+  +status: String           ' OPEN / LINKED / RESOLVED / DUPLICATE / DISMISSED
+  +occurredAt: OffsetDateTime
+  +payloadJson: String
+  +hashKey: String?
+  +masterHitId: String?     ' si doublon
 }
 
-class KycProfileItem {
-  +UUID id
-  +BlockType type
-  +UUID blockId // dernier block actif de ce type
-  +LocalDateTime linkedAt
+class ReviewInstanceProcess {
+  +id: String
+  +hitId: String            ' 1 hit → 0..1 process
+  +status: String           ' OPEN / IN_PROGRESS / CLOSED
+  +startedAt: OffsetDateTime
+  +closedAt: OffsetDateTime?
+  +outcome: String?         ' APPROVED / REJECTED / DISMISSED
+  +notes: String?
 }
 
-KycProfile "1" o-- "1..*" KycProfileItem
-KycProfileItem --> BlockInstance : references latest
+'===== FAMILY / RELATIONS =====
+class PartyRelation {
+  +id: String
+  +pivotPartyId: String     ' le “customer” pivot
+  +memberPartyId: String    ' le membre lié
+  +relationType: String     ' CO_HOLDER / MANDATAIRE / LEGAL_REP / ...
+  +active: Boolean
+  +status: String           ' ACTIVE / INACTIVE
+  +validFrom: OffsetDateTime
+  +validTo: OffsetDateTime?
+  +remediationStatus: String ' PENDING / COMPLETED / ...
+  +lastEvaluatedAt: OffsetDateTime?
+  +comment: String?
+}
 
-Review "1" o-- "1..*" ReviewSubject
-ReviewSubject "1" o-- "0..*" BlockInstance
+'===== AUDIT =====
+class AuditTrail {
+  +id: String
+  +entityType: String       ' PARTY / KYC_REVIEW_BLOCK / HIT / RELATION / REVIEW_PROCESS
+  +entityId: String
+  +action: String           ' CREATE / UPDATE / CLOSE / APPROVE / REJECT ...
+  +actor: String
+  +occurredAt: OffsetDateTime
+  +detailsJson: String?
+}
 
+'===== ASSOCIATIONS =====
+Party "1" o-- "0..*" KycReviewBlock
+CurrentKycBlockV ..> KycReviewBlock : <<derives>>
 
-note right of KycProfile
-- Contient la dernière version APPROVED de chaque BlockType
-- Lorsqu’un nouveau Block APPROVED est créé, le profil met à jour le lien vers ce Block et supprime le lien vers l’ancien
-- Vue consolidée en temps réel pour chaque client
-end note
+Party "1" o-- "0..*" Hit : "has hits"
+Hit "1" o-- "0..1" ReviewInstanceProcess : "triggers"
 
-note right of BlockInstance
-- Fingerprint = hash(type, subject/customer, keyFields)
-- Unique partial index sur statuts actifs
-- NAME_SCREENING: validité 6 mois
-end note
+' Hit peut impacter plusieurs blocs (et inversement)
+Hit "1" o-- "0..*" KycReviewBlock : "impacts (optionnellement une version courante)"
+
+' Famille (pivot -> membre)
+Party "1" o-- "0..*" PartyRelation : as pivot
+Party "1" o-- "0..*" PartyRelation : as member
+
+' Audit (générique)
+AuditTrail ..> Party
+AuditTrail ..> KycReviewBlock
+AuditTrail ..> Hit
+AuditTrail ..> PartyRelation
+AuditTrail ..> ReviewInstanceProcess
 @enduml
