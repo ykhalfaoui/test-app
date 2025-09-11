@@ -1,0 +1,125 @@
+Here’s a **concise, production-ready English prompt** you can paste into a ticket, doc, or another LLM to continue the work.
+
+---
+
+# 🎯 Prompt — KYC Platform (English)
+
+**Context & Goal**
+Build a modular KYC platform (Java 17, Spring Boot 3.x, Spring Modulith) to manage:
+
+* **Profiles** (`Party`) and their **KYC blocks** with **SCD Type 2 versioning** (`Block` / `BlockVersion`),
+* **Hits** that **trigger** a **review process** (`ReviewInstance`),
+* **Per-review family** (`ReviewMember`) — *no global PartyRelation table*,
+* **Review targets** (`ReviewTarget`) per *(review, person, blockKind)*,
+* **Config** of **required blocks per relation type** (`RelationTypeBlockScope`).
+
+Primary DB: **Oracle** (use **H2** for dev). Event-driven, **after-commit** only, idempotent with retries. Integrations (e.g., Salesforce) via outbox/eventing.
+
+---
+
+## 1) Modules (Spring Modulith)
+
+* **party**: `Party` aggregate (+ optional technical projectors for profile status if needed).
+* **blocks**: `Block` (one per *(party, kind)*) + `BlockVersion` (SCD2) + `CurrentBlockV` view.
+* **hits**: ingest/qualify a hit → publish `HitQualified`.
+* **review**: start `ReviewInstance`; freeze per-review **family** as `ReviewMember`; create `ReviewTarget`s; close when all targets are done.
+* **relations**: policy/config via `RelationTypeBlockScope(relationType, blockKind, isRequired)`.
+* **integration**: listen to domain events (e.g., `BlockVersionFinalized`, `ReviewClosed`) and upsert to Salesforce via **outbox** (idempotency + retry).
+* **audit**: explicit domain/audit events (state transitions, integration attempts, failures).
+* **kyc360**: read models (current blocks, members, targets; no global status in business view unless required).
+
+**Events**: use `@ApplicationModuleListener` + Modulith JPA event storage for **after-commit** delivery and republish on restart.
+
+---
+
+## 2) Business Data Model (simplified)
+
+* **Party**(id, externalRef, type, subType).
+* **Block**(id, partyId, kind). Constraint: **UNIQUE(partyId, kind)** (a Party owns at most one block per kind).
+* **BlockVersion**(id, blockId, versionNo, validFrom, validTo?, status, dataJson). SCD2: **single current** version (`validTo IS NULL`).
+
+  * Optional denormalization to enforce DB-level uniqueness: add `partyId`, `kind` + **UNIQUE(partyId, kind, versionNo)**.
+* **Hit**(id, partyId, hitType, occurredAt, payloadJson).
+* **ReviewInstance**(id, hitId?, pivotPartyId, startedAt, closedAt?, notes).
+  *Business view: no aggregate “statuses” stored here.*
+* **ReviewMember**(id, reviewId, memberPartyId, relationType, addedAt).
+  *Per-review “family”; again, business view stores no aggregate status.*
+* **ReviewTarget**(reviewId, targetPartyId, blockKind, blockVersionId? when finalized).
+  **Logical PK**: *(reviewId, targetPartyId, blockKind)* (enables idempotence).
+* **RelationTypeBlockScope**(relationType, blockKind, isRequired, policyCode?).
+
+**Views & DB rules**
+
+* `CurrentBlockV` = `BlockVersion.validTo IS NULL`.
+* Oracle: functional/partial unique index to guarantee **one current version per block**.
+
+---
+
+## 3) Core Rules & Flows
+
+**A) Trigger**
+
+1. A **qualified hit** arrives for a pivot `Party`.
+2. `review` creates a **ReviewInstance** and **freezes the family** as `ReviewMember` list (relationType captured here; there’s no global PartyRelation).
+3. For pivot and each member, compute **required block kinds** using `RelationTypeBlockScope` and create **ReviewTarget** per required kind.
+
+**B) Block lifecycle (SCD2)**
+
+* `ensureOpenVersion(partyId, kind)`:
+
+  * If an **open/in-progress** version exists → **reuse** it (coalesce).
+  * Else, **close** the current (`validTo = now`) and **create** `versionNo+1`.
+* `applyInitialStatus`:
+
+  * Determine initial status from inputs (e.g., auto-approve `STATIC_DATA`; otherwise `PENDING_AGENT`).
+
+**C) Progress & closure**
+
+* When a block is finalized, publish `BlockVersionFinalized(blockVersionId, partyId, kind, finalStatus)`.
+* `review` marks the matching **ReviewTarget** as **DONE** (idempotent via composite key).
+* When all targets are DONE, **close** the `ReviewInstance`.
+
+*Note:* If you need **per-relation review status** (tech view), aggregate a member’s required targets with rule `REJECTED > PENDING > APPROVED`. The **business view** may omit storing such statuses, per stakeholder request.
+
+---
+
+## 4) Concurrency, Idempotence, Scale
+
+* **Ownership**: `Block` is owned by one `Party`; **no N↔N** between Party and Block.
+* **Uniqueness**: `UNIQUE(partyId, kind)` on `Block`; **one current** `BlockVersion` per block (partial/functional unique index).
+* **Idempotent targets**: `ReviewTarget` key *(reviewId, targetPartyId, blockKind)*.
+* **Events**: after-commit only; Modulith **retries** + **republish** on restart.
+* Handles large families (e.g., **400+ members**) by generating targets per required kind; listeners update closure incrementally.
+
+---
+
+## 5) Integrations & Error Handling
+
+* **Salesforce**: listen to `BlockVersionFinalized(APPROVED)`, `ReviewClosed`, (optionally party changes).
+  Use **outbox** + idempotent upserts (keys like `party.externalRef`, `blockKind`, `versionNo`).
+  On failure: structured log to **ELK**, record outbox error, and keep retrying (backoff, DLQ if needed).
+* **Audit**: prefer explicit domain/audit events or entity listeners; avoid blanket AOP for everything.
+
+---
+
+## 6) HTTP API (MVP)
+
+* `POST /api/hits/qualified` → `{ partyId, hitType }` ⇒ create qualified hit & start review.
+* `GET /api/reviews/{id}` → review 360: pivot, members, targets, current block snapshots.
+* `GET /api/parties/{id}/kyc360` → read model: current blocks + family list (no aggregate statuses in business view).
+
+---
+
+## 7) Deliverables
+
+* **PlantUML**: class diagram (business-friendly, no statuses), ERD, sequence (Hit→Review→Blocks→Targets→Finalize→Close), component/package (Modulith).
+* **DDL**: Oracle + H2 (tables, indexes, `CurrentBlockV`, uniqueness).
+* **Spring Boot project**: module skeletons, SCD2 services, listeners, idempotent targets, after-commit events.
+* **Tests**: version coalescing, double-hit scenarios, concurrent block updates, large families, integration retries, idempotence.
+
+**Non-functionals**
+Java 17 • Spring Boot 3.3+ • Spring Modulith (events JPA) • H2 dev / Oracle prod • after-commit events • structured logs with correlation IDs (`reviewId`, `hitId`).
+
+---
+
+If you’d like, I can also provide a **one-page business diagram** (PlantUML) and a **ready-to-run Spring Boot skeleton** aligned with this prompt.
