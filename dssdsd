@@ -1,207 +1,122 @@
-Bien sûr ✅ Je vais te générer une **documentation bilingue (anglais + français)** claire et structurée sur ton modèle simplifié.
 
----
-
-# 📘 Data Model Documentation / Documentation du Modèle de Données
-
----
-
-## 1. Overview / Vue d’ensemble
-
-**English**
-The model describes how **customer profiles** are managed in a KYC (Know Your Customer) system. Each profile may have multiple **data blocks** (static data, documents, KYC, KYT, screening, etc.), which are versioned using an **SCD Type 2 approach** (Block + BlockVersion).
-Incoming **hits** (alerts, anomalies, screening results) are linked to the relevant profile and may impact one or several blocks. The system also manages **family relationships** between profiles (co-holders, legal representatives, beneficiaries), with a **remediation status** computed based on specific rules.
-
-**Français**
-Le modèle décrit la gestion des **profils clients** dans un système KYC (*Know Your Customer*). Chaque profil peut avoir plusieurs **blocs de données** (données statiques, documents, KYC, KYT, screening…), versionnés selon une approche **SCD Type 2** (Block + BlockVersion).
-Les **hits** (alertes, anomalies, résultats de screening) sont liés au profil concerné et peuvent impacter un ou plusieurs blocs. Le système gère aussi les **relations familiales** entre profils (co-titulaires, représentants légaux, bénéficiaires), avec un **statut de remédiation** calculé selon certaines règles.
-
----
-
-## 2. Main Entities / Entités principales
-
-### 2.1 Profile
-
-**EN**
-
-* Represents a customer profile in the KYC system.
-* Contains a unique identifier and customer reference.
-
-**FR**
-
-* Représente un profil client dans le système KYC.
-* Contient un identifiant unique et une référence client.
-
-**Attributes / Attributs**
-
-* `id: String` – Unique ID
-* `customerRef: String` – External reference (e.g., CRM or Core Banking)
-* `createdAt: DateTime` – Creation date
-
----
-
-### 2.2 Block
-
-**EN**
-
-* A logical data container for a profile (static data, documents, etc.).
-* Each block belongs to one profile.
-
-**FR**
-
-* Un conteneur logique de données pour un profil (données statiques, documents…).
-* Chaque bloc appartient à un profil.
-
-**Attributes / Attributs**
-
-* `id: String` – Unique ID
-* `profile: Profile` – Owning profile
-* `kind: String` – Type (STATIC\_DATA, DOCUMENTS, KYC, KYT, SCREENING, …)
-
----
-
-### 2.3 BlockVersion
-
-**EN**
-
-* A version of a block (SCD Type 2).
-* Tracks changes, approvals, rejections, and audit trail.
-
-**FR**
-
-* Une version d’un bloc (SCD Type 2).
-* Suit les modifications, validations, rejets et l’historique.
-
-**Attributes / Attributs**
-
-* `id: String`
-* `block: Block` – Reference to parent block
-* `versionNo: int` – Version number
-* `validFrom / validTo: DateTime` – Temporal validity
-* `status: String` – IN\_REVIEW, APPROVED, REJECTED
-* `dataJson: String` – JSON payload with block data
-
----
-
-### 2.4 CurrentBlockV (View)
-
-**EN**
-
-* A database view (or materialized view) exposing only the **current active version** of each block (`valid_to IS NULL`).
-
-**FR**
-
-* Une vue (ou vue matérialisée) exposant uniquement la **version active courante** de chaque bloc (`valid_to IS NULL`).
-
----
-
-### 2.5 Hit
-
-**EN**
-
-* Represents an alert/anomaly/event raised for a profile (e.g., sanction hit, PEP match, KYT anomaly).
-* Each hit is linked directly to a profile.
-* Can be linked to one or more blocks.
-
-**FR**
-
-* Représente une alerte/anomalie/événement détecté pour un profil (ex : alerte sanctions, match PEP, anomalie KYT).
-* Chaque hit est lié directement à un profil.
-* Peut être associé à un ou plusieurs blocs.
-
-**Attributes / Attributs**
-
-* `id: String`
-* `profile: Profile` – Related profile
-* `hitType: String` – Category of the hit
-* `severity: String` – Severity (LOW/MED/HIGH)
-* `payloadJson: String` – Full payload from detection system
-* `status: String` – OPEN, LINKED, RESOLVED, etc.
-
----
-
-### 2.6 HitBlockLink
-
-**EN**
-
-* Association table linking hits to the impacted blocks (and optionally to a specific block version under review).
-
-**FR**
-
-* Table d’association reliant les hits aux blocs impactés (et éventuellement à une version précise en cours de revue).
-
-**Attributes / Attributs**
-
-* `hitId: String`
-* `blockId: String`
-* `blockVersionId: String?` – Optional (set if a specific version was created)
-* `linkedAt: DateTime`
-
----
-
-### 2.7 ProfileFamilyLink
-
-**EN**
-
-* Association between a **pivot profile** and a **family member profile**.
-* Describes the type of relationship (e.g., co-holder, legal representative).
-* Contains remediation status computed based on the family member’s blocks.
-
-**FR**
-
-* Association entre un **profil pivot** et un **profil membre de famille**.
-* Décrit le type de relation (ex : co-titulaire, représentant légal).
-* Contient un statut de remédiation calculé sur la base des blocs du membre de famille.
-
-**Attributes / Attributs**
-
-* `id: String`
-* `pivot: Profile` – The main profile
-* `member: Profile` – The related profile
-* `relationType: String` – e.g., CO\_HOLDER, MANDATAIRE
-* `remediationStatus: String` – PENDING, COMPLETED, BLOCKED, etc.
-* `validFrom / validTo: DateTime` – Active period of the relation
-* `lastEvaluatedAt: DateTime` – Last remediation evaluation
-* `comment: String?` – Optional notes
-
----
-
-## 3. Relationships / Relations
-
-**English**
-
-* **Profile → Blocks**: One profile owns multiple blocks.
-* **Block → Versions**: Each block has several versions (SCD2).
-* **Profile → Hits**: Each hit is always attached to a profile.
-* **Hit ↔ Block**: Many-to-many association (a hit can impact multiple blocks).
-* **Profile ↔ Profile (Family)**: Family relations modeled via `ProfileFamilyLink` (pivot ↔ member).
-
-**Français**
-
-* **Profil → Blocs** : Un profil possède plusieurs blocs.
-* **Bloc → Versions** : Chaque bloc a plusieurs versions (SCD2).
-* **Profil → Hits** : Chaque hit est toujours rattaché à un profil.
-* **Hit ↔ Bloc** : Relation plusieurs-à-plusieurs (un hit peut impacter plusieurs blocs).
-* **Profil ↔ Profil (Famille)** : Relations familiales modélisées via `ProfileFamilyLink` (pivot ↔ membre).
-
----
-
-## 4. Usage Scenarios / Scénarios d’utilisation
-
-**EN**
-
-1. A new hit is detected for a profile → stored in `HITS` with link to the profile.
-2. The hit impacts a block → a record in `HIT_BLOCK_LINKS` is created (optionally linked to a new `BlockVersion`).
-3. The agent works on the **current block versions** (`CurrentBlockV`) and resolves the hit.
-4. Family links (`ProfileFamilyLink`) are used to compute remediation status: e.g., a co-holder’s screening or documents may affect the pivot profile’s risk.
-
-**FR**
-
-1. Un nouveau hit est détecté pour un profil → enregistré dans `HITS` avec lien vers le profil.
-2. Le hit impacte un bloc → création d’un enregistrement dans `HIT_BLOCK_LINKS` (optionnellement lié à une nouvelle `BlockVersion`).
-3. L’agent travaille sur les **versions courantes** (`CurrentBlockV`) et résout le hit.
-4. Les liens familiaux (`ProfileFamilyLink`) sont utilisés pour calculer le statut de remédiation : ex. le screening ou les documents d’un co-titulaire peuvent influencer le risque du profil pivot.
-
----
-
-👉 Veux-tu que je mette cette documentation dans un **fichier PDF** (anglais + français côte à côte) pour que tu puisses l’utiliser comme **référence officielle** dans ton projet ?
+@startuml
+title KYC – Business Data Model (Simplified for stakeholders)\n(Party • Blocks SCD2 • Hit • ReviewInstance • Family • Targets)
+
+hide methods
+skinparam linetype ortho
+skinparam classAttributeIconSize 0
+
+' ======== CORE ========
+class Party {
+  +id: String
+  +externalRef: String
+  +type: String
+  +subType: String
+}
+
+' ======== BLOCKS (SCD2) ========
+class Block {
+  +id: String
+  +kind: String                ' e.g. STATIC_DATA, DOCUMENTS, NAME_SCREENING
+  --
+  +partyId: String            ' -> Party.id (owner)
+}
+
+class BlockVersion {
+  +id: String
+  +blockId: String            ' -> Block.id
+  +versionNo: int
+  +validFrom: DateTime
+  +validTo: DateTime?
+  +status: String             ' IN_REVIEW | PENDING_AGENT | APPROVED | REJECTED
+  +dataJson: String
+}
+
+class "<<View>> CurrentBlockV" as CurrentBlockV {
+  +blockVersionId: String
+  +blockId: String
+  +partyId: String
+  +kind: String
+  +versionNo: int
+  +effectiveFrom: DateTime
+}
+
+Party "1" o-- "0..*" Block : owns >
+Block "1" o-- "0..*" BlockVersion : versions >
+CurrentBlockV ..> BlockVersion : <<derives>>
+
+note right of Block
+  Rule: UNIQUE (partyId, kind)\n→ One Block per Kind for a Party
+end note
+
+note right of BlockVersion
+  SCD2: at most one current per Block\n(validTo = NULL)\n\nOptional DB rule (denormalized):\nUNIQUE (partyId, kind, versionNo)
+end note
+
+' ======== HITS ========
+class Hit {
+  +id: String
+  +partyId: String            ' -> Party.id (concerned)
+  +hitType: String
+  +occurredAt: DateTime
+  +payloadJson: String
+}
+Party "1" o-- "0..*" Hit : has >
+
+' ======== REVIEW (process, no aggregate statuses) ========
+class ReviewInstance {
+  +id: String
+  +hitId: String?             ' -> Hit.id (optional)
+  +pivotPartyId: String       ' -> Party.id
+  +startedAt: DateTime
+  +closedAt: DateTime?
+  +notes: String?
+}
+Hit "1" o-- "0..1" ReviewInstance : triggers >
+Party "1" o-- "0..*" ReviewInstance : as pivot >
+
+' ======== FAMILY (captured per instance) ========
+class ReviewMember {
+  +id: String
+  +reviewId: String           ' -> ReviewInstance.id
+  +memberPartyId: String      ' -> Party.id
+  +relationType: String       ' e.g. MANDATAIRE, CO_HOLDER, LEGAL_REP
+  +addedAt: DateTime
+}
+ReviewInstance "1" o-- "0..*" ReviewMember : includes >
+Party "1" o-- "0..*" ReviewMember : as member >
+
+' ======== TARGETS (work items) ========
+class ReviewTarget {
+  +reviewId: String           ' -> ReviewInstance.id
+  +targetPartyId: String      ' -> Party.id (pivot or member)
+  +blockKind: String          ' e.g. DOCUMENTS, NAME_SCREENING
+  +blockVersionId: String?    ' -> BlockVersion.id (when finalized)
+  --
+  ' Logical PK: (reviewId, targetPartyId, blockKind)
+}
+ReviewInstance "1" o-- "0..*" ReviewTarget : targets >
+Party "1" o-- "0..*" ReviewTarget : as targetParty >
+BlockVersion "1" o-- "0..*" ReviewTarget : may finalize >
+
+' ======== CONFIG (business rules) ========
+class RelationTypeBlockScope {
+  +id: String
+  +relationType: String
+  +blockKind: String
+  +isRequired: boolean
+  +policyCode: String?
+}
+RelationTypeBlockScope ..> ReviewMember : defines required blockKinds
+RelationTypeBlockScope ..> ReviewTarget : filters by blockKind
+
+' ======== SHORT NOTES ========
+note bottom of ReviewMember
+Family is fixed when the ReviewInstance starts.\nNo statuses stored at Party/Member/Instance level in this view.
+end note
+
+note right of ReviewTarget
+A target = (instance, target party, block kind).\nIt optionally points to the BlockVersion used when finalized.
+end note
+
+@enduml
