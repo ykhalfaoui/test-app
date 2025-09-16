@@ -1,0 +1,113 @@
+Slide 1 — Intro / Contexte
+
+« Aujourd’hui, NABU est l’outil de remédiation KYC/KYT du KYC Office, mais il reste très manuel.
+Notre objectif avec Global Orchestrator, c’est une refonte complète pour automatiser au maximum.
+On commence par le segment Retail low-risk, qui représente environ 60 à 70 % des cas. »
+
+Slide 2 — Problème aujourd’hui
+
+« Les équipes passent du temps à récupérer des informations déjà disponibles ailleurs, et à répéter des contrôles identiques.
+Les relances clients sont nombreuses, et la traçabilité n’est pas toujours exploitable.
+Résultat : des délais longs et une charge importante sur les KYC Officers. »
+
+Slide 3 — Vision & Objectifs
+
+« Nous passons d’une revue périodique à un check permanent piloté par des événements.
+Dès qu’un signal arrive, on déclenche une micro-revue ciblée sur les bons blocs.
+Notre but : maximiser le STP (traitement automatique) et concentrer les KYC Officers sur les exceptions. »
+
+Slide 4 — Valeur pour le KYC Officer
+
+« Les données et documents sont récupérés automatiquement quand c’est possible.
+Les contrôles simples s’exécutent seuls ; l’agent ne traite que ce qui nécessite un jugement.
+La vue 360 et l’historique des décisions rendent la revue plus rapide et plus sûre. »
+
+Slide 5 — Concepts clés
+
+« Un Hit est un signal qui déclenche une Review.
+La ReviewInstance fige le périmètre — le client pivot et sa famille à traiter.
+Chaque domaine est un Block, versionné en SCD2 pour garder l’historique.
+On crée des Targets par bloc et par personne ; c’est idempotent et traçable. »
+
+Slide 6 — MVP
+
+« Pour le MVP, on démarre avec un hit iHub qui ouvre un dossier de remédiation.
+Les blocs ciblés sont d’abord Name Screening, puis Documents si éligible.
+On s’intègre à Salesforce en sortie et à ELK/APM pour l’observabilité. »
+
+Slide 7 — Architecture L2 (containers)
+
+« C’est un monolithe modulaire Spring Modulith, simple à opérer et à faire évoluer.
+Les modules communiquent par événements après commit ; les intégrations externes passent par une outbox avec retry et DLQ.
+La base Oracle/H2 porte le modèle, avec une vue “courant” pour les blocks. »
+
+Slide 8 — Séquence runtime
+
+« iHub envoie le hit → on crée la review et ses targets.
+Pour chaque target, on demande l’ouverture ou la réutilisation d’une version de block.
+Quand un block est finalisé, la review avance ; quand tout est terminé, on clôture et on pousse vers Salesforce. »
+
+Slide 9 — Données & SCD2
+
+« Un Block est unique par client et par type.
+On a une seule version courante ; les anciennes restent en historique.
+Cette approche sécurise l’audit, l’analyse et la réversibilité. »
+
+Slide 10 — Intégrations & Fiabilité
+
+« Aucun appel externe dans la transaction métier.
+On publie en outbox, on retente avec backoff, et on met en DLQ en cas d’erreur permanente.
+On utilise des clés d’idempotence pour éviter les doublons côté Salesforce. »
+
+Slide 11 — KPIs cibles
+
+« Notre cible : +30 à +50 % de STP sur le low-risk.
+–40 % de cycle time sur les cas automatisables.
+Et –50 % de temps agent par dossier low-risk. »
+
+Slide 12 — Roadmap
+
+« MVP : hit iHub → review → screening/doc → Salesforce.
+Wave 2 : étendre les blocs et les règles (KYT, documents avancés), enrichir la vue 360.
+Wave 3 : montée en charge sur les familles nombreuses, scoring et règles élargies. »
+
+Slide 13 — Risques & Mesures
+
+« Données incomplètes : validateurs et fallback manuel.
+Règles qui évoluent : politiques par type de block et feature flags.
+Pic de volume : cibles idempotentes et listeners scalables.
+Dépendances externes : outbox, retry, DLQ et monitoring. »
+
+Slide 14 — Démo (script)
+
+« Je crée un Party, je reçois un hit iHub.
+La Review et les Targets sont générées.
+Je finalise un block : la review progresse et se clôture quand tout est fait.
+On vérifie l’upsert Salesforce dans les logs. »
+
+Slide 15 — Conclusion / Next steps
+
+« On valide le périmètre MVP et les KPIs.
+On lance l’implémentation et les tests d’idempotence, de charge et d’intégration.
+Et on propose un pilote sur le segment Retail low-risk. »
+
+Transitions utiles (à placer entre slides)
+
+« Concrètement, voici ce que ça change au quotidien… »
+
+« Regardons maintenant la séquence d’exécution en conditions réelles. »
+
+« Côté données, la clé c’est le versionning simple et fiable. »
+
+« Pour les intégrations, notre priorité est la robustesse. »
+
+Si on te demande “STP, c’est quoi ?”
+
+« STP, c’est Straight-Through Processing : un traitement de bout en bout sans intervention humaine. Notre design vise à l’augmenter sur les cas simples, et à réserver l’humain aux exceptions. »
+
+Tu veux que je t’en fasse une version PowerPoint avec ces phrases en notes de présentation sous chaque slide ?
+
+
+On transforme NABU en orchestrateur automatisé : dès qu’un signal pertinent arrive, on lance une micro-revue ciblée, on automatise les cas simples (low-risk), et on réserve les KYC Officers aux vraies exceptions — avec traçabilité et performance mesurables.
+
+« STP, c’est Straight-Through Processing : un traitement de bout en bout sans intervention humaine. Notre design vise à l’augmenter sur les cas simples, et à réserver l’humain aux exceptions. »
