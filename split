@@ -1,0 +1,78 @@
+Parfait — voici un **tableau de synthèse** puis les **tableaux détaillés par feature** avec *split*, *chiffrage* et *description* pour que tu voies précisément quoi implémenter et où se niche la complexité.
+
+---
+
+# Vue d’ensemble (par feature)
+
+| Feature                                                                         | Résumé                                                                                                                                                                  | Chemin critique                                              | Chiffrage global                                         | Points durs / risques                                                            |
+| ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | -------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| **FTR-INITLOAD** – Initialisation des blocks (clients existants)                | Batch Spring pour créer idempotemment les Blocks (SCD2 v1) des clients actifs IND, avec export CSV vers Salesforce et réconciliation.                                   | Reader BDWH → Writer DB → Writer CSV → Réconciliation        | **27 SP** • **PERT ≈ 14,5 JH** (fourchette **12–18 JH**) | Robustesse I/O NAS, idempotence DB (UQ), SQL de diff SF                          |
+| **FTR-ONBOARDING** – Création & switch (Customer ↔ Third-party) + Approved-Gate | Ingestion événements (T24/Onboarding), projection Party, création/MAJ des blocks **seulement si** la version courante est `APPROVED` (gate), outbox résiliente vers SF. | Inbox/Projection → Gate/Listeners → OOS différé → Outbox SF  | **27 SP** • **PERT ≈ 14,5 JH** (fourchette **12–18 JH**) | Courses/races sur le Gate, outbox idempotente et robuste, gestion double source  |
+| **FTR-DDR-E2E** – Hit → Review → Famille → Blocks → SF                          | Flux de bout en bout déclenché par `ihub.ddr.start_review` : vérif scope → review → famille (bulk) → init/gestion blocks (main+famille) → synchro SF.                   | Inbox → Review PM → Famille → Blocks (Gate/SCD2) → Outbox SF | **42 SP** • **PERT ≈ 22,3 JH** (fourchette **18–28 JH**) | Volumétrie famille (400+), orchestration PM, SCD2 sous Gate, cohérence & retries |
+
+> SP = Story Points ; JH = jours-homme par dev ; PERT = (min + 4×vraisemblable + max)/6.
+
+---
+
+# Détail par feature — Split, chiffrage et description
+
+## FTR-INITLOAD — Initialisation des blocks
+
+| Lot (Split)                                           | Ce que ça couvre (description)                                                                                     | Cas limites / risques clés                              | Dépendances                 | Tests à prévoir                                            | Chiffrage (min / **vraisemblable** / max) → **PERT** |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------- | --------------------------- | ---------------------------------------------------------- | ---------------------------------------------------- |
+| **Reader BDWH (clients actifs IND)**                  | Source JDBC read-only ; filtres statut actif + IND ; pagination ; mapping `CustomerDto`; métriques & logs corrélés | Timeouts BDWH, gros volume (400k), variations de schéma | Accès BDWH, filtres validés | Unit mapper ; Intégration dataset ; Perf (simulation 400k) | 1 / **1,5** / 2 j → **1,6 j** (\~3 SP)               |
+| **Processor matrice type→blocks**                     | Matrice Customer/Third-party → `IN_SCOPE`/`OUT_OF_SCOPE` ; sortie `PlannedBlock` ; logs de décision                | Types inattendus ; future extensibilité                 | Règles métier figées        | Unit paramétrés                                            | 1 / **1,5** / 2 j → **1,6 j** (\~3 SP)               |
+| **Writer DB idempotent (PARTY/BLOCK/BLOCK\_VERSION)** | Upsert PARTY ; `UQ(party,kind)` pour BLOCK ; création v1 `INITIALIZED`/`OOS`; horodatage ; skip sur conflit        | UQ Oracle, SCD2-light correcte, re-run batch            | DDL validé                  | Intégration H2/Oracle ; re-run idempotent                  | 2 / **2,5** / 3,5 j → **2,7 j** (\~5 SP)             |
+| **Writer CSV (NAS) + atomic rename**                  | Génère `customerId;blockId;blockType;status;version` (UTF-8/LF) ; écrit `.tmp` puis rename atomique ; checksum     | Espace NAS, droits, corruption I/O                      | Chemin/nommage NAS          | Intégration fichiers ; corruption simulée                  | 2 / **2,5** / 3,5 j → **2,7 j** (\~5 SP)             |
+| **Table scope & rejouabilité**                        | `INITLOAD_SCOPE(runTag, partyId, status, error)` ; filtrage job par scope ; reprise ciblée                         | Doublons dans scope ; parties inconnues                 | DDL scope                   | Intégration (job filtré/non filtré)                        | 1 / **1,5** / 2 j → **1,6 j** (\~3 SP)               |
+| **Réconciliation Salesforce (staging + diff SQL)**    | Charge extract SF en staging ; anti-joins pour manquants/désalignés ; alimente scope                               | Extract incomplet, qualités de données                  | Format extract SF           | Jeux artificiels d’écarts ; vérif scope produit            | 2 / **2,5** / 3,5 j → **2,7 j** (\~5 SP)             |
+| **Observabilité (logs/metrics/traces)**               | Logs JSON (runTag), métriques RED/USE, spans par step                                                              | Faible                                                  | Stack observabilité         | Tests de métriques/alertes                                 | 1 / **1,5** / 2 j → **1,6 j** (\~3 SP)               |
+
+**Total INITLOAD (PERT)** ≈ **14,5 JH** (12–18 JH)
+
+---
+
+## FTR-ONBOARDING — Création & switch + Approved-Gate
+
+| Lot (Split)                                   | Ce que ça couvre (description)                                                                               | Cas limites / risques clés          | Dépendances            | Tests à prévoir                   | Chiffrage (min / **vraisemblable** / max) → **PERT** |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------- | ---------------------- | --------------------------------- | ---------------------------------------------------- |
+| **Adapter T24 (snapshot JSON)**               | Ingestion événements T24 ; validations schéma ; Inbox idempotente `(source,eventId)` ; mapping **canonique** | Payload partiel, horodatage         | Contrat T24            | Contract tests ; Idempotence      | 1 / **1,5** / 2 j → **1,6 j** (\~3 SP)               |
+| **Adapter Onboarding (op+snapshot)**          | Source alternative (feature-flag) ; mêmes garanties ; opérations explicites (CREATE/UPDATE/SWITCH)           | Divergences sémantiques             | Contrat Onboarding     | Contract tests                    | 1 / **1,5** / 2 j → **1,6 j** (\~3 SP)               |
+| **Inbox & Projection**                        | UQ `(source,eventId)` ; `PARTY_PROJECTION(last_ts)` pour ignorer out-of-order ; métriques                    | Concurrence, ordering               | DDL validé             | Intégration ordering ; replays    | 2 / **2,5** / 3,5 j → **2,7 j** (\~5 SP)             |
+| **Listeners BlockKind + Approved-Gate**       | Détermine IN\_SCOPE/OOS ; **NE crée PAS** si courant ≠ `APPROVED` ; crée v+1 sinon                           | Courses, races, état courant fiable | DDL Blocks             | Unit gate ; Intégration courses   | 2 / **2,5** / 3,5 j → **2,7 j** (\~5 SP)             |
+| **OUT\_OF\_SCOPE différé**                    | Enregistre OOS si courant ≠ `APPROVED` ; applique à l’`APPROVED`/fin de review                               | Synchronisation tardive             | Event `block.approved` | Intégration (déclenchement/apply) | 1 / **1,5** / 2 j → **1,6 j** (\~3 SP)               |
+| **Outbox Salesforce (UPSERT + retry/dedupe)** | UPSERT idempotent par ExternalId ; retry/backoff+jitter ; DLQ ; journal erreurs                              | Pannes/quota SF, dédoublonnage      | Contrat SF             | Intégration retries/dedupe        | 2 / **2,5** / 3,5 j → **2,7 j** (\~5 SP)             |
+| **Observabilité**                             | Logs `NO_OP_APPROVED_GATE` ; métriques gate/outbox ; traces inter-modules                                    | Faible                              | Stack obs              | Tests métriques/alertes           | 1 / **1,5** / 2 j → **1,6 j** (\~3 SP)               |
+
+**Total ONBOARDING (PERT)** ≈ **14,5 JH** (12–18 JH)
+
+---
+
+## FTR-DDR-E2E — Hit → Review → Famille → Blocks → SF
+
+| Lot (Split)                                          | Ce que ça couvre (description)                                                                                        | Cas limites / risques clés                  | Dépendances                 | Tests à prévoir                 | Chiffrage (min / **vraisemblable** / max) → **PERT** |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- | --------------------------- | ------------------------------- | ---------------------------------------------------- |
+| **Adapter iHub + Inbox (idempotence)**               | Consomme `ihub.ddr.start_review` ; UQ `(source,reviewExternalId)` ; calcule décision scope (snapshot) ; `hit.checked` | Doublons, scope manquant                    | Contrat iHub ; scope loader | Unit + Intégration idempotence  | 2 / **2,5** / 3,5 j → **2,7 j** (\~5 SP)             |
+| **Review Process Manager (unicité + orchestration)** | **Une review active par party** (UQ fonctionnelle Oracle) ; états ; timeouts ; événements de progression              | UQ partielle Oracle, transitions            | DDL UQ ; timers             | Intégration états & UQ          | 2 / **2,5** / 3,5 j → **2,7 j** (\~5 SP)             |
+| **Famille (bulk, pagination, retry)**                | Récup bulk paginé ; digital score par membre ; fallback **MAIN\_ONLY** si timeout ; retry planifié                    | 400+ membres, snapshot cohérent, throttling | API famille ; Data Platform | Perf/pagination ; timeout/retry | 3 / **4** / 6 j → **4,2 j** (\~8 SP)                 |
+| **Policy rôle→blocks (versionnée)**                  | Table role×block\_kind→policy/priorité ; agrégation multi-rôles “plus restrictif” ; export SF si utile                | Cohérence métier, évolutivité               | Règles métier               | Unit agrégation                 | 2 / **2,5** / 3,5 j → **2,7 j** (\~5 SP)             |
+| **Blocks (Approved-Gate + SCD2) – main + famille**   | Algo **existence/en-cours/historiser/créer** ; `REVIEW_TARGET` (lien review-blockVersion-role) ; events               | Races ; bloc partagé par plusieurs reviews  | DDL Blocks/Targets          | Intégration SCD2 + concurrence  | 3 / **4** / 6 j → **4,2 j** (\~8 SP)                 |
+| **Deferred OOS + job d’application**                 | Persiste OOS différé ; applique sur `block.approved` ; job de ratissage                                               | Ordonnancement & cohérence                  | Event gate ; scheduler      | Intégration apply & ratissage   | 1 / **1,5** / 2,5 j → **1,7 j** (\~3 SP)             |
+| **Outbox → Salesforce (UPSERT + retry/dedupe)**      | Dedupe key, retries/backoff+jitter, DLQ, journal d’erreurs                                                            | Pannes/quota SF                             | Contrat SF                  | Intégration retries/dedupe      | 2 / **2,5** / 3,5 j → **2,7 j** (\~5 SP)             |
+| **Observabilité & DLQ**                              | Logs décisionnels, métriques (backlogs, NO-OP), traces E2E, admin DLQ                                                 | Faible                                      | Stack obs                   | Tests d’alertes backlogs        | 1 / **1,5** / 2 j → **1,6 j** (\~3 SP)               |
+
+**Total DDR-E2E (PERT)** ≈ **22,3 JH** (18–28 JH)
+
+---
+
+## Lecture rapide des colonnes
+
+* **Split (Lots)** : ce que tu dois **implémenter** concrètement.
+* **Description** : le **périmètre fonctionnel & technique** livré par le lot.
+* **Cas limites / risques** : *où* est la **complexité** (courses, volumétrie, I/O, ordering).
+* **Chiffrage** : **min / vraisemblable / max** → **PERT** pour un effort plus réaliste.
+* **Chemin critique** : l’ordre des lots qui **détermine la durée** globale.
+
+---
+
+Si tu veux, je peux te sortir ces tableaux en **CSV** (pour Jira/Confluence) ou en **XLSX** (avec formules PERT) — dis-moi le format que tu préfères.
