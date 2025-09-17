@@ -1,0 +1,376 @@
+### \[FR] SECTION 1 — Confluence – Mini Blueprint (markdown + PlantUML)
+
+# FTR-INITLOAD – Initialisation des blocks KYC/KYT pour clients existants (CSV Salesforce + scope)
+
+## 1. Contexte & objectif
+
+Initialiser les **blocks KYC/KYT** pour l’ensemble des **clients individuels actifs** depuis le **BDWH**, créer les entités dans la base GO (**idempotent**, SCD2 v1), puis **exporter un CSV unique** pour import côté **Salesforce**.
+Fournir un mécanisme de **relance ciblée** (par *scope* en table technique) et une **réconciliation 100% SQL** (tables externes/staging, anti-joins) pour détecter et corriger les manques (customers/blocks).
+
+## 2. Portée
+
+**In** : Job All (seed + export), Job Scoped (seed + export via table *scope*), Réconciliation SQL (chargement export SF → staging → diffs → alimentation *scope*).
+**Out** : Appels API Salesforce (on utilise CSV), gestion des PII (le CSV n’en contient pas), UI.
+**Hypothèses figées** : BDWH et GO sur **bases distinctes** ; CSV **UTF-8**, **LF** ; fichier unique sur **NAS** ; statuts métier initiaux `INITIALIZED` (pertinents) / `OUT_OF_SCOPE` (non pertinents).
+**Dépendances** : Accès **BDWH** (lecture), **NAS** (lecture/écriture), privilèges **Oracle DIRECTORY / EXTERNAL TABLE**, équipe Salesforce (import + extract).
+**Cas limites** : doublons BDWH, clients absents côté SF, blocs manquants, redémarrage Step 2 (export), volumétrie (≈ 400k individus).
+
+## 3. Architecture (C4)
+
+{plantuml}
+@startuml
+!include \<C4/C4\_Container>
+title FTR-INITLOAD – C4 (L2 résumé)
+
+Person(ops, "Ops/Batch")
+System\_Boundary(go, "KYC Platform (GO)") {
+Container(app, "GO Monolith", "Spring Boot 3 + Spring Batch/Modulith", "Jobs InitLoad-All & InitLoad-Scoped; Réconciliation SQL orchestrée")
+ContainerDb(db, "GO DB", "Oracle/H2", "PARTY, BLOCK, BLOCK\_VERSION, INITLOAD\_SCOPE, STG\_\*")
+Container(file, "NAS", "Filesystem", "Export CSV à Salesforce")
+}
+System\_Ext(bdwh, "BDWH", "Oracle", "Source clients actifs")
+System\_Ext(sf, "Salesforce", "SaaS", "Import CSV; fournit un extract CSV")
+
+Rel(ops, app, "Démarre Jobs / scripts")
+Rel(app, bdwh, "Lecture par lots (hydrate staging)")
+Rel(app, db, "Seed idempotent + staging + scope")
+Rel(app, file, "Écrit CSV (tmp → rename)")
+Rel(sf, file, "Importe CSV (process SF)")
+Rel(ops, app, "Réconciliation SQL (charge extract SF → staging → diffs)")
+@enduml
+{plantuml}
+
+```plantuml
+@startuml
+' Copie de secours (sans include C4)
+actor "Ops/Batch" as OPS
+node "GO Monolith\n(Spring Batch)" as APP
+database "GO DB\n(PARTY, BLOCK, VERSION,\nINITLOAD_SCOPE, STG_*)" as DB
+cloud "BDWH\n(Oracle)" as DWH
+rectangle "NAS\n(CSV)" as NAS
+cloud "Salesforce" as SF
+
+OPS --> APP : Démarre Jobs
+APP --> DWH : Lecture clients (hydrate STG)
+APP --> DB : Seed idempotent (Party/Blocks)
+APP --> NAS : Export CSV (.tmp → .csv)
+SF --> NAS : Import CSV
+OPS --> APP : Réconciliation SQL (charge extract SF → STG → diffs)
+APP --> DB : Alimente INITLOAD_SCOPE (runTag)
+@enduml
+```
+
+## 4. Séquence principale
+
+{plantuml}
+@startuml
+title FTR-INITLOAD – Séquence (Scoped avec BDWH séparé + Export + Réconciliation)
+
+actor Ops
+participant "InitLoad-Scoped\nB0: HydrateStagingFromBDWH" as B0
+participant "InitLoad-Scoped\nB1: SeedFromScope" as B1
+participant "InitLoad-Scoped\nB2: ExportScopeCsv" as B2
+database "GO DB\n(INITLOAD\_SCOPE, STG, PARTY/BLOCK)" as DB
+database "BDWH DB" as DWH
+file "NAS: go-initblocks-<runTag>.csv" as CSV
+participant "ReconcileWithSF\n(SQL scripts)" as RC
+file "sf-blocks-extract.csv" as SFC
+
+Ops -> B0 : start(runTag)
+B0 -> DB : read scope(runTag)
+B0 -> DWH : SELECT party attrs WHERE ext\_ref IN (\:batchIds)
+DWH --> B0 : attrs(type, subtype, ...)
+B0 -> DB : MERGE into STG(runTag, ext\_ref, attrs)
+
+Ops -> B1 : continue(runTag)
+B1 -> DB : JOIN SCOPE x STG
+B1 -> DB : upsert PARTY; upsert BLOCKS (INITIALIZED/OUT\_OF\_SCOPE)
+B1 -> DB : mark scope status (PROCESSED/SKIPPED\_DUPLICATE/ERROR)
+
+Ops -> B2 : export(runTag)
+B2 -> DB : SELECT ... JOIN scope(runTag) status in (PROCESSED,SKIPPED\_DUPLICATE)
+B2 -> CSV : write .tmp (transactional chunks) → rename .csv
+
+\== Réconciliation ==
+Ops -> RC : load SFC -> STG\_SF
+RC -> DB : anti-joins → INSERT into INITLOAD\_SCOPE(newRunTag,PENDING)
+Ops -> B0 : rerun(newRunTag) ' hydrate/seed/export scope ciblé
+@enduml
+{plantuml}
+
+## 5. Modèle de données (diff)
+
+* **INITLOAD\_SCOPE**(id, party\_external\_ref, run\_tag, source, status, error\_code, error\_message, created\_at, processed\_at)
+  Index : **UX(run\_tag, party\_external\_ref)** ; IX(run\_tag, status, party\_external\_ref) ; rétention par `run_tag`.
+* **BDWH\_PARTY\_STG**(run\_tag, external\_ref, party\_type, party\_subtype, hydrated\_at)
+  PK(run\_tag, external\_ref) ; purge J+30.
+* **SF\_BLOCKS\_STG**(run\_tag, party\_id, block\_type, status, version, loaded\_at) *(si on charge l’extract dans une table)*
+  PK(run\_tag, party\_id, block\_type).
+* **Aucun changement métier** : `PARTY(external_ref)` **UNIQUE** ; `BLOCK(party_id, kind)` **UNIQUE** ; `BLOCK_VERSION(block_id, valid_to)` index.
+
+## 6. Sécurité & Privacy
+
+* **AuthN/AuthZ** : lancement jobs réservé aux rôles `BATCH_ADMIN`; scripts SQL opérés par comptes restreints.
+* **Secrets** : credentials BDWH et GO via **Vault/Secrets** (pas en clair).
+* **Chiffrement** : NAS confié au SI ; CSV **sans PII** (IDs et types uniquement).
+* **STRIDE** :
+
+  * **T** (spoofing) : RBAC, comptes techniques dédiés.
+  * **R** (tampering) : pattern `.tmp → rename`, checksum SHA-256 loggé.
+  * **R** (repudiation) : logs JSON corrélés `runTag`, audit des scripts.
+  * **I** (info disclosure) : pas de PII, ACL NAS.
+  * **D** (DoS) : throttling BDWH (batch size), limites NAS.
+  * **E** (elevation) : moindres privilèges Oracle (DIRECTORY/EXTERNAL TABLE ciblés).
+
+## 7. Observabilité
+
+* **Logs JSON** : par step/chunk (`runTag`, `scopeSize`, `hydrated`, `processed`, `skippedDuplicates`, `errors`, `csvPathTmp`, `csvPathFinal`, `rowsWritten`, `durationMs`).
+* **Métriques** : `batch_items_processed_total`, `batch_items_failed_total{step}`, `batch_duration_seconds`, `csv_bytes_written`, `bdwh_batches_total`.
+* **Traces** : span par step (B0/B1/B2), corrélation `runTag`.
+* **Alertes** : échec step, taux d’erreurs > seuil, absence de fichier final, diffs reconcil > seuil.
+
+## 8. Tests & critères d’acceptation (macro)
+
+* **Unit** : processor/writer (upsert idempotent, mapping status).
+* **Intégration** : multi-DataSource (BDWH mock), contraintes uniques, SkipPolicy duplicats.
+* **E2E** : Job B complet (scope réduit), export CSV (pattern tmp), restart Step 2.
+* **Perf** : 400k individus → temps total sous fenêtre week-end ; batch size BDWH calibré.
+* **Sécurité** : RBAC jobs, pas de secrets en logs, permissions NAS.
+* **Non-régression** : seed rerunable sans doublon ; reconcil alimente correctement le scope.
+
+---
+
+### \[FR] SECTION 2 — Stories (CSV prêt à importer Jira)
+
+Issue Type,Summary,Description,Acceptance Criteria,Assignee,Components,Labels,Priority,Story Points,Fix Version/s,Blocks,Feature ID
+Story,"\[FTR-INITLOAD] Créer tables techniques INITLOAD\_SCOPE et BDWH\_PARTY\_STG","Créer les tables et index Oracle (scope + staging BDWH) et scripts de purge.","""Étant donné le schéma GO
+Quand je déploie les DDL
+Alors les tables INITLOAD\_SCOPE et BDWH\_PARTY\_STG existent avec leurs index
+Et je peux insérer, mettre à jour, purger par runTag""",TBD,"data,backend","ftr-initload",High,3,2025.Q4,,"FTR-INITLOAD"
+Story,"\[FTR-INITLOAD] Job A – SeedAllFromBDWH (idempotent)","Reader BDWH (individus actifs) + writer upsert PARTY/BLOCK (SCD2 v1), skip duplicats.","""Étant donné un BDWH avec N clients actifs
+Quand j’exécute SeedAll
+Alors PARTY/BLOCK sont créés sans doublon
+Et un second run ne crée rien de supplémentaire""",TBD,"backend,data","ftr-initload",High,8,2025.Q4,"\[FTR-INITLOAD] Créer tables techniques INITLOAD\_SCOPE et BDWH\_PARTY\_STG","FTR-INITLOAD"
+Story,"\[FTR-INITLOAD] Job A – ExportAllCsv (tmp→rename)","Writer CSV UTF-8/LF, fichier unique sur NAS, pattern .tmp → rename atomique, restart-safe.","""Étant donné des blocks en base
+Quand j’exécute ExportAll
+Alors un fichier .csv est produit (pas de .tmp restant)
+Et en cas de crash Step 2, un restart régénère le fichier complet sans doublons""",TBD,"backend","ftr-initload",High,5,2025.Q4,"\[FTR-INITLOAD] Job A – SeedAllFromBDWH (idempotent)","FTR-INITLOAD"
+Story,"\[FTR-INITLOAD] Job B0 – HydrateStagingFromBDWH","Multi-DataSource ; lecture de scope ; batch SELECT IN (...) vers BDWH ; MERGE dans BDWH\_PARTY\_STG.","""Étant donné une table INITLOAD\_SCOPE(runTag)
+Quand j’exécute HydrateStaging
+Alors les métadonnées BDWH des parties du scope sont présentes en BDWH\_PARTY\_STG(runTag)
+Et l’opération est idempotente""",TBD,"backend,data","ftr-initload",High,5,2025.Q4,"\[FTR-INITLOAD] Créer tables techniques INITLOAD\_SCOPE et BDWH\_PARTY\_STG","FTR-INITLOAD"
+Story,"\[FTR-INITLOAD] Job B1 – SeedFromScopeUsingStaging","Reader JOIN scope x staging ; writer upsert PARTY/BLOCK ; marquage status scope (PROCESSED/SKIPPED\_DUPLICATE/ERROR).","""Étant donné INITLOAD\_SCOPE(runTag) et BDWH\_PARTY\_STG(runTag)
+Quand j’exécute SeedFromScope
+Alors chaque party du scope est créée sans doublon
+Et la ligne scope passe à PROCESSED ou SKIPPED\_DUPLICATE
+Et les erreurs sont tracées""",TBD,"backend,data","ftr-initload",High,8,2025.Q4,"\[FTR-INITLOAD] Job B0 – HydrateStagingFromBDWH","FTR-INITLOAD"
+Story,"\[FTR-INITLOAD] Job B2 – ExportScopeCsv","Reader export avec JOIN scope (PROCESSED/SKIPPED\_DUPLICATE) ; writer CSV (tmp→rename).","""Étant donné un runTag avec scope traité
+Quand j’exécute ExportScopeCsv
+Alors le CSV ne contient que le périmètre du scope
+Et il est régénérable en restart""",TBD,"backend","ftr-initload",Medium,3,2025.Q4,"\[FTR-INITLOAD] Job B1 – SeedFromScopeUsingStaging","FTR-INITLOAD"
+Story,"\[FTR-INITLOAD] Réconciliation SQL – Charger export SF en staging","Créer EXTERNAL TABLE ou STG SF\_BLOCKS\_STG + script de chargement/normalisation (TRIM/UPPER).","""Étant donné un fichier sf-blocks-extract.csv UTF-8
+Quand je lance le script de chargement
+Alors les lignes valides sont disponibles en STG avec runTag SF
+Et les erreurs de format sont tracées""",TBD,"data,backend","ftr-initload",Medium,3,2025.Q4,,"FTR-INITLOAD"
+Story,"\[FTR-INITLOAD] Réconciliation SQL – Calculer diffs et alimenter INITLOAD\_SCOPE","Anti-joins SQL (customers/blocks manquants) → INSERT PENDING dans INITLOAD\_SCOPE(newRunTag).","""Étant donné GO (PARTY/BLOCK) et STG SF
+Quand j’exécute le script de réconciliation
+Alors les customers/blocks manquants sont insérés dans INITLOAD\_SCOPE(newRunTag, PENDING)""",TBD,"data,backend","ftr-initload",Medium,3,2025.Q4,"\[FTR-INITLOAD] Réconciliation SQL – Charger export SF en staging","FTR-INITLOAD"
+Story,"\[FTR-INITLOAD] Observabilité & sécurité batch","Logs JSON corrélés runTag, métriques RED, alertes ; RBAC lancement jobs ; checksum CSV.","""Étant donné une exécution normale
+Quand je consulte logs et métriques
+Alors je vois les compteurs clé par step
+Et des alertes se déclenchent en cas d’échec step ou absence de fichier final""",TBD,"observability,devsecops,backend","ftr-initload",Medium,3,2025.Q4,,"FTR-INITLOAD"
+Story,"\[FTR-INITLOAD] Scripts d’exploitation (run, restart, scope)","CLI/Shell pour lancer Job A/B avec paramètres (runTag, scope), et réconciliation SQL.","""Étant donné les scripts fournis
+Quand j’exécute une relance par scope
+Alors seuls les clients indiqués sont seedés/exportés
+Et les scripts retournent des codes d’état explicites""",TBD,"backend","ftr-initload",Low,2,2025.Q4,,"FTR-INITLOAD"
+
+### \[FR] SECTION 3 — Estimation – Haut niveau (par feature)
+
+* **T-shirt global** : **L**
+* **Tableau**
+
+| Story                                                      | SP | JH (plage) | Risque |
+| ---------------------------------------------------------- | -: | ---------: | ------ |
+| Créer tables techniques INITLOAD\_SCOPE & BDWH\_PARTY\_STG |  3 |    0.5–1 j | Faible |
+| Job A – SeedAllFromBDWH (idempotent)                       |  8 |      3–5 j | Moyen  |
+| Job A – ExportAllCsv (tmp→rename)                          |  5 |      2–3 j | Faible |
+| Job B0 – HydrateStagingFromBDWH                            |  5 |      2–3 j | Moyen  |
+| Job B1 – SeedFromScopeUsingStaging                         |  8 |      3–5 j | Moyen  |
+| Job B2 – ExportScopeCsv                                    |  3 |      1–2 j | Faible |
+| Réconciliation SQL – Charger export SF                     |  3 |      1–2 j | Faible |
+| Réconciliation SQL – Diffs → INITLOAD\_SCOPE               |  3 |      1–2 j | Faible |
+| Observabilité & sécurité batch                             |  3 |      1–2 j | Faible |
+| Scripts d’exploitation                                     |  2 |    0.5–1 j | Faible |
+
+* **Chemin critique** :
+
+  1. Tables techniques → 2) Job A SeedAll → 3) Job A ExportAll → 4) B0 HydrateStaging → 5) B1 SeedFromScope → 6) B2 ExportScope → 7) Réconciliation (chargement + diffs).
+* **Hypothèses & inconnues** :
+
+  * Format exact de l’**extract SF** (owner: Salesforce, d.cible: J+7)
+  * Accès **Oracle DIRECTORY/EXTERNAL TABLE** (owner: DBA, d.cible: J+5)
+  * Débit BDWH autorisé (owner: DBA BDWH, d.cible: J+5)
+
+### \[FR] SECTION 4 — Risques, décisions, trade-offs
+
+* **Risques clés** :
+
+  * Fichier unique volumineux sur NAS → test perf, checksum, place disque.
+  * Droits Oracle EXTERNAL TABLE → anticiper habilitations.
+  * Doublons BDWH → validation DISTINCT + logs de rejets.
+  * Fenêtre week-end serrée → calibrage batch size BDWH/Chunk, monitoring.
+* **Décisions d’architecture (ADRs)** :
+
+  * Réconciliation **SQL-first** (tables externes/staging + anti-joins) au lieu d’un batch applicatif.
+  * **Deux jobs** (ALL / SCOPED) et **trois steps** pour SCOPED (B0/B1/B2) avec staging BDWH local.
+  * Export CSV **tmp→rename**, **restart-safe**, **fichier unique**.
+  * **Idempotence** par contraintes uniques + SkipPolicy (doublons skippés).
+* **Trade-offs** :
+
+  * CSV vs API SF : **simplicité & volume** vs temps réel.
+  * Staging BDWH local : **perf & anti N+1** vs stockage temporaire.
+  * Fichier unique : **opérations simples** vs taille ; alternative : split (non retenue pour MVP).
+
+---
+
+### \[EN] SECTION 1 — Confluence – Mini Blueprint (markdown + PlantUML)
+
+# FTR-INITLOAD – Initialize KYC/KYT blocks for existing customers (Salesforce CSV + scope)
+
+## 1. Context & Goal
+
+Initialize **KYC/KYT blocks** for all **active individual customers** from **BDWH**, create entities in GO DB (**idempotent**, SCD2 v1), then **export a single CSV** for **Salesforce** import.
+Provide **targeted reruns** via a **scope table** and a **SQL-only reconciliation** (external/staging tables, anti-joins) to detect and fix missing customers/blocks.
+
+## 2. Scope
+
+**In**: All-job (seed + export), Scoped-job (seed + export via scope table), SQL reconciliation (load SF export → staging → diffs → feed scope).
+**Out**: Salesforce APIs (we use CSV), PII handling (CSV has none), UI.
+**Frozen assumptions**: BDWH and GO are **separate DBs**; CSV **UTF-8**, **LF**; single file on **NAS**; initial business statuses `INITIALIZED` (in scope) / `OUT_OF_SCOPE` (not applicable).
+**Dependencies**: **BDWH** access (read), **NAS** (R/W), **Oracle DIRECTORY / EXTERNAL TABLE** privileges, Salesforce team (import + extract).
+**Edge cases**: BDWH duplicates, customers missing in SF, blocks missing, Step-2 restart (export), volume (\~400k individuals).
+
+## 3. Architecture (C4)
+
+{plantuml}
+@startuml
+!include \<C4/C4\_Container>
+title FTR-INITLOAD – C4 (L2 summary)
+
+Person(ops, "Ops/Batch")
+System\_Boundary(go, "KYC Platform (GO)") {
+Container(app, "GO Monolith", "Spring Boot 3 + Spring Batch/Modulith", "InitLoad-All & InitLoad-Scoped jobs; SQL reconciliation orchestrated")
+ContainerDb(db, "GO DB", "Oracle/H2", "PARTY, BLOCK, BLOCK\_VERSION, INITLOAD\_SCOPE, STG\_\*")
+Container(file, "NAS", "Filesystem", "CSV export for Salesforce")
+}
+System\_Ext(bdwh, "BDWH", "Oracle", "Active customers source")
+System\_Ext(sf, "Salesforce", "SaaS", "CSV import; provides CSV extract")
+
+Rel(ops, app, "Start Jobs / scripts")
+Rel(app, bdwh, "Batch reads (hydrate staging)")
+Rel(app, db, "Seed idempotent + staging + scope")
+Rel(app, file, "Write CSV (tmp → rename)")
+Rel(sf, file, "Imports CSV (SF process)")
+Rel(ops, app, "SQL reconciliation (load SF extract → staging → diffs)")
+@enduml
+{plantuml}
+
+```plantuml
+@startuml
+' Fallback (no C4 includes)
+actor "Ops/Batch" as OPS
+node "GO Monolith\n(Spring Batch)" as APP
+database "GO DB\n(PARTY, BLOCK, VERSION,\nINITLOAD_SCOPE, STG_*)" as DB
+cloud "BDWH\n(Oracle)" as DWH
+rectangle "NAS\n(CSV)" as NAS
+cloud "Salesforce" as SF
+
+OPS --> APP : Start Jobs
+APP --> DWH : Read customers (hydrate STG)
+APP --> DB : Seed idempotent (Party/Blocks)
+APP --> NAS : Export CSV (.tmp → .csv)
+SF --> NAS : Import CSV
+OPS --> APP : SQL Reconciliation (load SF extract → STG → diffs)
+APP --> DB : Populate INITLOAD_SCOPE (runTag)
+@enduml
+```
+
+## 4. Main Sequence
+
+{plantuml}
+@startuml
+title FTR-INITLOAD – Sequence (Scoped with separate BDWH + Export + Reconciliation)
+
+actor Ops
+participant "InitLoad-Scoped\nB0: HydrateStagingFromBDWH" as B0
+participant "InitLoad-Scoped\nB1: SeedFromScope" as B1
+participant "InitLoad-Scoped\nB2: ExportScopeCsv" as B2
+database "GO DB\n(INITLOAD\_SCOPE, STG, PARTY/BLOCK)" as DB
+database "BDWH DB" as DWH
+file "NAS: go-initblocks-<runTag>.csv" as CSV
+participant "ReconcileWithSF\n(SQL scripts)" as RC
+file "sf-blocks-extract.csv" as SFC
+
+Ops -> B0 : start(runTag)
+B0 -> DB : read scope(runTag)
+B0 -> DWH : SELECT party attrs WHERE ext\_ref IN (\:batchIds)
+DWH --> B0 : attrs(type, subtype, ...)
+B0 -> DB : MERGE into STG(runTag, ext\_ref, attrs)
+
+Ops -> B1 : continue(runTag)
+B1 -> DB : JOIN SCOPE x STG
+B1 -> DB : upsert PARTY; upsert BLOCKS (INITIALIZED/OUT\_OF\_SCOPE)
+B1 -> DB : mark scope status (PROCESSED/SKIPPED\_DUPLICATE/ERROR)
+
+Ops -> B2 : export(runTag)
+B2 -> DB : SELECT ... JOIN scope(runTag) status in (PROCESSED,SKIPPED\_DUPLICATE)
+B2 -> CSV : write .tmp (transactional chunks) → rename .csv
+
+\== Reconciliation ==
+Ops -> RC : load SFC -> STG\_SF
+RC -> DB : anti-joins → INSERT into INITLOAD\_SCOPE(newRunTag,PENDING)
+Ops -> B0 : rerun(newRunTag) ' hydrate/seed/export scoped rerun
+@enduml
+{plantuml}
+
+## 5. Data Model (diff)
+
+* **INITLOAD\_SCOPE**(id, party\_external\_ref, run\_tag, source, status, error\_code, error\_message, created\_at, processed\_at)
+  Index: **UX(run\_tag, party\_external\_ref)**; IX(run\_tag, status, party\_external\_ref); retention by `run_tag`.
+* **BDWH\_PARTY\_STG**(run\_tag, external\_ref, party\_type, party\_subtype, hydrated\_at)
+  PK(run\_tag, external\_ref); purge after 30 days.
+* **SF\_BLOCKS\_STG**(run\_tag, party\_id, block\_type, status, version, loaded\_at) *(if loading the extract into a table)*
+  PK(run\_tag, party\_id, block\_type).
+* **No domain changes**: `PARTY(external_ref)` **UNIQUE**; `BLOCK(party_id, kind)` **UNIQUE**; index on `BLOCK_VERSION(block_id, valid_to)`.
+
+## 6. Security & Privacy
+
+* **AuthN/AuthZ**: jobs restricted to `BATCH_ADMIN`; SQL scripts under least-privileged accounts.
+* **Secrets**: BDWH/GO creds via **Vault/Secrets**.
+* **Encryption**: NAS under IT control; CSV **no PII** (IDs/types only).
+* **STRIDE**:
+
+  * **T**: RBAC, dedicated svc accounts.
+  * **R**: `.tmp → rename` pattern, SHA-256 checksum logged.
+  * **R**: JSON logs with `runTag`, script audit.
+  * **I**: no PII, NAS ACLs.
+  * **D**: BDWH throttling, NAS quotas.
+  * **E**: Oracle DIRECTORY/EXTERNAL TABLE minimal grants.
+
+## 7. Observability
+
+* **JSON logs**: step/chunk (`runTag`, `scopeSize`, `hydrated`, `processed`, `skippedDuplicates`, `errors`, `csvPathTmp`, `csvPathFinal`, `rowsWritten`, `durationMs`).
+* **Metrics**: `batch_items_processed_total`, `batch_items_failed_total{step}`, `batch_duration_seconds`, `csv_bytes_written`, `bdwh_batches_total`.
+* **Traces**: spans per step (B0/B1/B2), `runTag` correlation.
+* **Alerts**: step failure, error rate > threshold, missing final CSV, recon diffs > threshold.
+
+## 8. Testing & Acceptance (macro)
+
+* **Unit**: processor/writer (idempotent upsert, status mapping).
+* **Integration**: multi-DataSource (mock BDWH), unique constraints, SkipPolicy for duplicates.
+* **E2E**: full Scoped job (small scope), CSV export (tmp pattern), Step-2 restart.
+* **Performance**: 400k individuals → within weekend window; BDWH batch size tuned.
+* **Security**: RBAC jobs, no secrets in logs, NAS permissions.
+* **Non-regression**: seed rerunnable without duplicates; reconciliation properly feeds scope.
+
+---
