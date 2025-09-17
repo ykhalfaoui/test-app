@@ -1,0 +1,398 @@
+### \[FR] SECTION 1 — Confluence – Mini Blueprint (markdown + PlantUML)
+
+# FTR-DDR-E2E — De l’hit à la revue (acteur principal + famille) & synchro Salesforce
+
+## 1. Contexte & objectif
+
+À la réception de `ihub.ddr.start_review`, GO exécute un flux **de bout en bout** : qualification de l’**hit**, ouverture d’une **review** pour le **client principal**, **constitution de la famille**, **initialisation/gestion des blocks** (principal + membres), puis **synchronisation Salesforce**.
+MVP : automatiser au maximum, prioriser **static data**, garantir **idempotence** et **observabilité**.
+
+## 2. Portée
+
+**In** :
+
+* Adapter iHub (Inbox idempotente) → `hit.checked(true|false)`
+* Review Process Manager (une **review active** max par party) → `review.instance.started`
+* Famille (bulk + roles policy versionnée) → `family.created`
+* Blocks (Approved-Gate : créer une nouvelle version **seulement si** la courante est `APPROVED`) → `block.created|existing`
+* Outbox → Salesforce (UPSERT par **ExternalId**)
+* Sécurité/obs : logs JSON, métriques RED/USE, traces E2E, DLQ
+
+**Out** : UI, suppression/fermeture de party, moteur de règles complet (placeholder : statut `VALID` par défaut).
+
+**Hypothèses figées (MVP)** :
+
+* **Unicité** : UQ Inbox `(source='IHUB', reviewExternalId)` ; UQ `REVIEW_INSTANCE(party_id)` quand `status in ('OPEN','IN_PROGRESS')`.
+* **Scope** : chargement **par snapshot** (on écrase), mais **versionné** pour audit ; décision stockée sur `HIT.decision_scope_id`.
+* **Famille** : snapshot au démarrage ; si timeout KO → **MAIN\_ONLY** puis retry planifié.
+* **Deferred OOS** si courant ≠ `APPROVED` (triggers : changement de type, changement de policy rôle→block).
+* **Retry policy** : max 5 tentatives, backoff exponentiel + jitter, DLQ & alerte.
+* **ExternalIds SF** : `Hit=IHUB:{reviewExtId}`, `Review=GO:{reviewId}`, `Block=GO:{partyId}-{blockKind}`.
+
+## 3. Architecture (C4)
+
+{plantuml}
+@startuml
+!include \<C4/C4\_Container>
+title FTR-DDR-E2E – C4 (L2)
+
+Person(kyco, "KYCO / Ops")
+System\_Boundary(go, "KYC Platform (GO)") {
+Container(hit, "Hit", "Spring Modulith", "Consomme iHub, vérifie scope, émet hit.checked")
+Container(pm, "Review PM", "Spring Modulith", "Crée/trace review, séquence le flux")
+Container(fam, "Family", "Spring Modulith", "Récupère famille, calcule roles/policy, émet family.created")
+Container(blk, "Blocks", "Spring Modulith", "Init/gestion par BlockKind, Approved-Gate, SCD2")
+Container(intsf, "SF Integration", "Spring", "Outbox → UPSERT Hit/Review/Blocks")
+Container(audit, "Obs/Audit", "Stack", "Logs JSON, métriques, traces, DLQ")
+ContainerDb(db, "GO DB", "Oracle", "HIT, REVIEW\_INSTANCE, FAMILY\_MEMBER, REVIEW\_TARGET, PARTY, BLOCK, BLOCK\_VERSION, ROLE\_BLOCK\_POLICY, EVENT\_INBOX, OUTBOX, DEFERRED\_SCOPE")
+}
+System\_Ext(ihub, "iHub", "Events", "ihub.ddr.start\_review")
+System\_Ext(pms, "Party MS", "Svc", "AML/KYC")
+System\_Ext(dp, "Data Platform", "Svc", "Digital score")
+System\_Ext(sf, "Salesforce", "SaaS", "Upsert par ExternalId")
+
+Rel(ihub, hit, "publish start\_review")
+Rel(hit, pm, "hit.checked.true")
+Rel(pm, pms, "GET party")
+Rel(pm, dp, "computeDigital")
+Rel(pm, fam, "review\.instance.started")
+Rel(fam, blk, "family.created")
+Rel(pm, blk, "review\.instance.started")
+Rel(blk, intsf, "block.created/existing (Outbox)")
+Rel(intsf, sf, "UPSERT", "async")
+Rel(go, db, "R/W")
+@enduml
+{plantuml}
+
+```plantuml
+@startuml
+title C4 fallback — FTR-DDR-E2E
+actor iHub
+queue "EVENT_INBOX" as INB
+participant "Hit" as HIT
+participant "Review PM" as PM
+participant "Family" as FAM
+participant "Blocks" as BLK
+queue "OUTBOX→SF" as OUT
+database "GO DB" as DB
+cloud "Salesforce" as SF
+
+iHub -> INB : start_review(reviewExtId, partyId)
+INB -> HIT : consume (UQ ok)
+HIT -> PM : hit.checked(true|false)
+PM -> FAM : review.instance.started
+FAM -> BLK : family.created
+PM -> BLK : review.instance.started
+BLK -> DB : exist/gate/historize/create
+BLK -> OUT : BlockUpserted/Existing
+OUT -> SF : Upsert (ExternalId)
+@enduml
+```
+
+## 4. Séquence principale
+
+{plantuml}
+@startuml
+title FTR-DDR-E2E — Séquence principale
+
+actor "iHub" as IH
+participant "Hit" as HIT
+participant "Review PM" as PM
+participant "Family" as FAM
+participant "Blocks" as BLK
+participant "SF Outbox" as SFO
+database "GO DB" as DB
+
+IH -> HIT : start\_review(reviewExtId, partyId)
+HIT -> DB : Inbox UQ insert
+HIT -> HIT : checkScope(scopeActive)
+alt out of scope
+HIT -> SFO : Upsert Hit(false)
+return
+else in scope
+HIT -> SFO : Upsert Hit(true)
+HIT -> PM : hit.checked.true
+PM -> PM : create REVIEW\_INSTANCE (UQ: one active/party)
+PM -> FAM : review\.instance.started
+FAM -> FAM : fetch family (bulk, paginated)
+alt timeout/KO
+FAM -> PM : family.main\_only
+else ok
+FAM -> BLK : family.created(members, rolePolicy)
+end
+PM -> BLK : review\.instance.started
+BLK -> DB : for each BlockKind: gate/exist/historize/create
+BLK -> SFO : block.created/existing (UPSERT)
+end
+@enduml
+{plantuml}
+
+## 5. Modèle de données (diff + diagrammes)
+
+* **HIT**(id, source\_event\_id **UQ**, review\_external\_id **UQ**, party\_id, in\_scope, reason, decision\_scope\_id, created\_at)
+* **REVIEW\_INSTANCE**(id, hit\_id, party\_id, status, started\_at) + **UQ** partielle `party_id` quand `status in ('OPEN','IN_PROGRESS')`
+* **FAMILY\_MEMBER**(id, review\_id, party\_id, roles\_csv, digital\_score, related\_to\_party\_id)
+* **ROLE\_BLOCK\_POLICY**(id, role, block\_kind, policy `REQUIRED|OPTIONAL|OUT_OF_SCOPE`, priority, valid\_from, valid\_to)
+* **REVIEW\_TARGET**(id, review\_id, block\_id, block\_version\_id, subject\_party\_id, role, status\_agg)
+* **BLOCK**(id, party\_id, kind, scope\_status, current\_version\_id, **UQ(party\_id,kind)**)
+* **BLOCK\_VERSION**(id, block\_id, version\_no, state `INITIALIZED|IN_REVIEW|LOCKED|APPROVED`, valid\_from, valid\_until, data\_json)
+* **DEFERRED\_SCOPE**(id, block\_id, target\_status=`OUT_OF_SCOPE`, reason, created\_at, applied\_at?)
+* **EVENT\_INBOX**(source, event\_id **UQ**, party\_id, payload\_json, event\_ts, status)
+* **OUTBOX**(event\_type, aggregate\_id, external\_id, dedupe\_key **UQ**, payload\_json, status, attempts, last\_error, next\_run\_at)
+
+{plantuml}
+@startuml
+title FTR-DDR-E2E — Modèle de domaine
+
+class Hit {+id;+sourceEventId;+reviewExternalId;+partyId;+inScope;+reason;+decisionScopeId;+createdAt}
+class ReviewInstance {+id;+hitId;+partyId;+status;+startedAt}
+class FamilyMember {+id;+reviewId;+partyId;+rolesCsv;+digitalScore;+relatedToPartyId}
+class RoleBlockPolicy {+id;+role;+blockKind;+policy;+priority;+validFrom;+validTo}
+class ReviewTarget {+id;+reviewId;+blockId;+blockVersionId;+subjectPartyId;+role;+statusAgg}
+
+class Party {+id;+externalRef;+type;+subType;+status}
+class Block {+id;+partyId;+kind;+scopeStatus;+currentVersionId?}
+class BlockVersion {+id;+blockId;+versionNo;+state;+validFrom?;+validUntil?;+dataJson}
+
+Hit "1" o-- "0..1" ReviewInstance
+ReviewInstance "1" o-- "0..*" FamilyMember
+ReviewInstance "1" o-- "0..*" ReviewTarget
+Party "1" o-- "0..*" Block
+Block "1" o-- "1..*" BlockVersion
+RoleBlockPolicy ..> FamilyMember : policyBy(role)
+@enduml
+{plantuml}
+
+## 6. Sécurité & Privacy
+
+* AuthN/AuthZ par module (Hit/Review/Family/Blocks/SF).
+* Secrets/credentials en vault ; données au repos chiffrées (DB/volumes).
+* **PII minimale** dans events/logs ; masquage systématique si nécessaire.
+* STRIDE : Tampering (schémas versionnés + validation), Repudiation (Inbox/Outbox/Audit), DoS (throttling, backpressure), Elevation (RBAC/SoD).
+
+## 7. Observabilité
+
+* **Logs clés** : `HIT_SCOPE_FALSE/TRUE`, `REVIEW_STARTED`, `FAMILY_MAIN_ONLY/FAMILY_READY`, `BLOCK_NOOP/CREATED/HISTORIZED`, `APPROVED_GATE_NOOP`, `OUTBOX_RETRY/DLQ`.
+* **Métriques SLO candidates** :
+
+  * `latency_start_review_to_review_started_p95 < 5s` (hors SF)
+  * `outbox_pending`, `failed_publications`, `deferred_scope_open`
+* **Traces** : iHub→Hit→Review→Family→Blocks→Outbox (tags `partyId`, `reviewId`, `blockKind`).
+* **Alertes** : backlog outbox > seuil, DLQ non vide, family timeout taux>seuil.
+
+## 8. Tests & critères d’acceptation (macro)
+
+* Unit : scope check, role→block policy, Approved-Gate, OOS différé.
+* Intégration : Inbox idempotence, UQ review active, Outbox dedupe+retry.
+* E2E : in-scope vs out-of-scope, famille KO→MAIN\_ONLY, block courant IN\_REVIEW (NO-OP), courant APPROVED (historiser+créer), synchro SF idempotente.
+* Perf : famille 400+ (partition/throttle), outbox throughput nominal.
+
+---
+
+### \[FR] SECTION 3 — Estimation – Haut niveau (avec descriptions)
+
+* **T-shirt global** : **L**
+
+| Poste                               | SP | JH (plage) | Risque | Description                                                |
+| ----------------------------------- | -: | ---------: | ------ | ---------------------------------------------------------- |
+| Adapter iHub + Inbox (idempotence)  |  5 |      2–3 j | Moyen  | Consommer `start_review`, schéma, UQ, publication interne. |
+| Review PM (unicité + orchestration) |  5 |      2–3 j | Moyen  | UQ review active/party, états, émission d’événements.      |
+| Famille (bulk, pagination, retry)   |  8 |      3–5 j | Élevé  | API bulk, snapshot, MAIN\_ONLY fallback, retry planifié.   |
+| Policy rôle→blocks (versionnée)     |  5 |      2–3 j | Moyen  | Modèle/table, priorité, agrégation multi-rôles.            |
+| Blocks (Approved-Gate + SCD2)       |  8 |      3–5 j | Moyen  | Existence/gate/historiser/créer, attachement review.       |
+| Deferred OOS + job d’application    |  3 |      1–2 j | Moyen  | Persister différé, appliquer sur `block.approved`.         |
+| Outbox→SF (UPSERT + retry/dedupe)   |  5 |      2–3 j | Moyen  | Dedupe key, retry/backoff, journalisation erreurs.         |
+| Observabilité & DLQ                 |  3 |      1–2 j | Faible | Logs/métriques/traces, alertes, DLQ admin.                 |
+
+**Chemin critique** : Inbox→Review PM→Family→Blocks→Outbox.
+
+---
+
+### \[FR] SECTION 4 — Risques, décisions, trade-offs
+
+* **Risques** : volumétrie famille, indispo SF, dérive contrats externes, accumulation OOS différés.
+* **Mitigations** : pagination/throttle, Outbox+retry+DLQ, schémas versionnés+tests contractuels, job d’application différés.
+* **Décisions (ADRs)** :
+
+  * ADR-DDR-001 : **Une review active par party** (UQ partielle).
+  * ADR-DDR-002 : **Scope snapshot versionné** (écrasement mais audit).
+  * ADR-DDR-003 : **Approved-Gate** + **Deferred OOS**.
+  * ADR-DDR-004 : **Outbox SF** idempotente (ExternalId).
+  * ADR-DDR-005 : **Policy rôle→blocks** versionnée.
+* **Trade-offs** : cohérence ↑ (gate, UQ, snapshots) vs réactivité ↓ (OOS différé) ; chorégraphie modulaire vs orchestration centrale (PM).
+
+---
+
+## ————————————————————————————————————————————————————————
+
+### \[EN] SECTION 1 — Confluence – Mini Blueprint (markdown + PlantUML)
+
+# FTR-DDR-E2E — From Hit to Review (main + family) & Salesforce sync
+
+## 1. Context & Goal
+
+Upon `ihub.ddr.start_review`, GO runs an **end-to-end** flow: **hit** qualification, **review** for the **main customer**, **family** build, **block** init/management (main + members), then **Salesforce** sync.
+MVP: maximize automation, prioritize **static data**, ensure **idempotency** and **observability**.
+
+## 2. Scope
+
+**In**:
+
+* iHub adapter (idempotent Inbox) → `hit.checked(true|false)`
+* Review Process Manager (max **one active review** per party) → `review.instance.started`
+* Family (bulk + versioned role policy) → `family.created`
+* Blocks (Approved-Gate: create a new version **only if** current is `APPROVED`) → `block.created|existing`
+* Outbox → Salesforce (UPSERT by **ExternalId**)
+* Security/obs: JSON logs, RED/USE metrics, E2E traces, DLQ
+
+**Out**: UI, party deletion/closure, full rule engine (placeholder: default `VALID`).
+
+**Frozen assumptions (MVP)**:
+
+* **Uniqueness**: Inbox UQ `(source='IHUB', reviewExternalId)`; partial UQ `REVIEW_INSTANCE(party_id)` when `status in ('OPEN','IN_PROGRESS')`.
+* **Scope**: **snapshot** loads (replace-all) but **versioned** for audit; `HIT.decision_scope_id` stores the decision base.
+* **Family**: snapshot at start; on timeout → **MAIN\_ONLY** with scheduled retry.
+* **Deferred OOS** if current ≠ `APPROVED` (triggers: type switch, role→block policy change).
+* **Retry policy**: up to 5 attempts, exponential backoff + jitter, DLQ & alert.
+* **ExternalIds SF**: `Hit=IHUB:{reviewExtId}`, `Review=GO:{reviewId}`, `Block=GO:{partyId}-{blockKind}`.
+
+## 3. Architecture (C4)
+
+{plantuml}
+@startuml
+!include \<C4/C4\_Container>
+title FTR-DDR-E2E – C4 (L2, EN)
+
+Person(kyco, "KYCO / Ops")
+System\_Boundary(go, "KYC Platform (GO)") {
+Container(hit, "Hit", "Spring Modulith", "Consume iHub, scope check, emit hit.checked")
+Container(pm, "Review PM", "Spring Modulith", "Create/track review, orchestrate flow")
+Container(fam, "Family", "Spring Modulith", "Fetch family, compute roles/policy, emit family.created")
+Container(blk, "Blocks", "Spring Modulith", "Per BlockKind, Approved-Gate, SCD2")
+Container(intsf, "SF Integration", "Spring", "Outbox → UPSERT Hit/Review/Blocks")
+ContainerDb(db, "GO DB", "Oracle", "HIT, REVIEW\_INSTANCE, FAMILY\_MEMBER, REVIEW\_TARGET, PARTY, BLOCK, BLOCK\_VERSION, ROLE\_BLOCK\_POLICY, EVENT\_INBOX, OUTBOX, DEFERRED\_SCOPE")
+}
+System\_Ext(ihub, "iHub", "Events", "ihub.ddr.start\_review")
+System\_Ext(pms, "Party MS", "Svc", "AML/KYC")
+System\_Ext(dp, "Data Platform", "Svc", "Digital score")
+System\_Ext(sf, "Salesforce", "SaaS", "ExternalId upsert")
+
+Rel(ihub, hit, "publish start\_review")
+Rel(hit, pm, "hit.checked.true")
+Rel(pm, pms, "GET party")
+Rel(pm, dp, "computeDigital")
+Rel(pm, fam, "review\.instance.started")
+Rel(fam, blk, "family.created")
+Rel(pm, blk, "review\.instance.started")
+Rel(blk, intsf, "block.created/existing (Outbox)")
+Rel(intsf, sf, "UPSERT", "async")
+Rel(go, db, "R/W")
+@enduml
+{plantuml}
+
+## 4. Main Sequence
+
+{plantuml}
+@startuml
+title FTR-DDR-E2E — Main sequence
+
+actor "iHub" as IH
+participant "Hit" as HIT
+participant "Review PM" as PM
+participant "Family" as FAM
+participant "Blocks" as BLK
+participant "SF Outbox" as SFO
+database "GO DB" as DB
+
+IH -> HIT : start\_review(reviewExtId, partyId)
+HIT -> DB : Inbox UQ insert
+HIT -> HIT : checkScope
+alt out of scope
+HIT -> SFO : Upsert Hit(false)
+return
+else in scope
+HIT -> SFO : Upsert Hit(true)
+HIT -> PM : hit.checked.true
+PM -> PM : create REVIEW\_INSTANCE (UQ one active/party)
+PM -> FAM : review\.instance.started
+FAM -> FAM : fetch family (bulk/paged)
+alt timeout/KO
+FAM -> PM : family.main\_only
+else ok
+FAM -> BLK : family.created(members, rolePolicy)
+end
+PM -> BLK : review\.instance.started
+BLK -> DB : per BlockKind: gate/exist/historize/create
+BLK -> SFO : block.created/existing (UPSERT)
+end
+@enduml
+{plantuml}
+
+## 5. Data Model (diff + diagrams)
+
+Same entities/keys as FR (`HIT`, `REVIEW_INSTANCE`, `FAMILY_MEMBER`, `ROLE_BLOCK_POLICY`, `REVIEW_TARGET`, `BLOCK`, `BLOCK_VERSION`, `DEFERRED_SCOPE`, `EVENT_INBOX`, `OUTBOX`).
+
+{plantuml}
+@startuml
+title FTR-DDR-E2E — Domain Model (EN)
+
+class Hit {+id;+sourceEventId;+reviewExternalId;+partyId;+inScope;+reason;+decisionScopeId;+createdAt}
+class ReviewInstance {+id;+hitId;+partyId;+status;+startedAt}
+class FamilyMember {+id;+reviewId;+partyId;+rolesCsv;+digitalScore;+relatedToPartyId}
+class RoleBlockPolicy {+id;+role;+blockKind;+policy;+priority;+validFrom;+validTo}
+class ReviewTarget {+id;+reviewId;+blockId;+blockVersionId;+subjectPartyId;+role;+statusAgg}
+
+class Party {+id;+externalRef;+type;+subType;+status}
+class Block {+id;+partyId;+kind;+scopeStatus;+currentVersionId?}
+class BlockVersion {+id;+blockId;+versionNo;+state;+validFrom?;+validUntil?;+dataJson}
+
+Hit "1" o-- "0..1" ReviewInstance
+ReviewInstance "1" o-- "0..*" FamilyMember
+ReviewInstance "1" o-- "0..*" ReviewTarget
+Party "1" o-- "0..*" Block
+Block "1" o-- "1..*" BlockVersion
+RoleBlockPolicy ..> FamilyMember : policyBy(role)
+@enduml
+{plantuml}
+
+## 6. Security & Privacy
+
+AuthN/Z per module; vault secrets; **minimize PII** in events/logs; versioned schemas + validation; STRIDE mitigations; DLQ for invalid messages.
+
+## 7. Observability
+
+Key logs (`HIT_SCOPE_*`, `REVIEW_STARTED`, `FAMILY_*`, `BLOCK_*`, `APPROVED_GATE_NOOP`, `OUTBOX_*`), SLO-candidate metrics, E2E traces, alerts on outbox/deferred/DLQ backlogs.
+
+## 8. Testing & Acceptance (macro)
+
+Unit (scope check, role policy, Approved-Gate, deferred OOS), Integration (Inbox UQ, active review UQ, Outbox retry/dedupe), E2E (in/out-of-scope, family fallback, IN\_REVIEW vs APPROVED, SF idempotent sync), Performance (big families).
+
+---
+
+### \[EN] SECTION 3 — High-level Estimation
+
+* **Global T-shirt**: **L**
+
+| Work item                         | SP | PH (range) | Risk | Description                                                |
+| --------------------------------- | -: | ---------: | ---- | ---------------------------------------------------------- |
+| iHub Adapter + Inbox              |  5 |      2–3 d | Med  | Consume/validate/Idempotent store, publish internal event. |
+| Review PM                         |  5 |      2–3 d | Med  | One active review per party, states, orchestration.        |
+| Family (bulk, paging, retry)      |  8 |      3–5 d | High | Bulk API, snapshot, MAIN\_ONLY fallback, scheduled retry.  |
+| Role→Block policy (versioned)     |  5 |      2–3 d | Med  | Table/model, priority, multi-role aggregation.             |
+| Blocks (Approved-Gate + SCD2)     |  8 |      3–5 d | Med  | Gate/exist/historize/create, attach to review.             |
+| Deferred OOS + applicator job     |  3 |      1–2 d | Med  | Persist/apply on `block.approved`.                         |
+| Outbox→SF (UPSERT + retry/dedupe) |  5 |      2–3 d | Med  | Dedupe key, retry/backoff, error journal.                  |
+| Observability & DLQ               |  3 |      1–2 d | Low  | Logs/metrics/traces, alerts, admin tools.                  |
+
+---
+
+### \[EN] SECTION 4 — Risks, Decisions, Trade-offs
+
+* **Risks**: family volume, SF outages/quotas, contract drift, deferred OOS pile-up.
+* **Mitigations**: paging/throttle, Outbox+retry+DLQ, versioned schemas & contract tests, applicator job + alerts.
+* **Decisions (ADRs)**: one active review/party; versioned scope snapshots; Approved-Gate + deferred OOS; idempotent SF Outbox; versioned role→block policy.
+* **Trade-offs**: stronger consistency (gate, UQ, snapshots) vs slower OOS application; choreography modularity vs process manager clarity.
+
+---
+
+Si tu veux, je peux maintenant te générer **les DDL Oracle** (tables/idx) et **les squelettes Spring Modulith** (events + listeners + outbox) alignés sur ce blueprint.
