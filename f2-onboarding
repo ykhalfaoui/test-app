@@ -1,0 +1,620 @@
+Parfait — voici la **PHASE 2 complète** pour tes **deux features**, en **français puis anglais**, **sans stories**, et avec des **modèles (domaine + données) intégrés**.
+
+---
+
+### \[FR] SECTION 1 — Confluence – Mini Blueprint (markdown + PlantUML)
+
+# FTR-INITLOAD – Initialisation des Blocks pour les clients existants
+
+## 1. Contexte & objectif
+
+Initialiser les **blocs KYC/KYT** pour tous les **clients individuels actifs** déjà présents en banque afin d’obtenir un **état de référence** cohérent côté GO (Global Orchestrator) et côté Salesforce.
+Sortie attendue : **création idempotente** des blocs selon **matrice type** (Customer vs Third-party) + **export CSV** pour ingestion Salesforce + mécanismes de **rejeu** et **réconciliation**.
+
+## 2. Portée
+
+**In** : Spring Batch (reader BDWH, processor matrice, writer DB + CSV), idempotence (contraintes uniques), **scope** de rejouabilité, réconciliation (chargement extract SF + diff SQL), observabilité.
+**Out** : UI, temps réel, fermeture de party, suppression physique.
+**Hypothèses figées** :
+
+* Types : `CUSTOMER`, `THIRD_PARTY`; subType MVP : `IND`.
+* Matrice :
+
+  * `CUSTOMER` ⇒ 7 blocs `IN_SCOPE` (`INITIALIZED`)
+  * `THIRD_PARTY` ⇒ `STATIC_DATA` + `DOC_IHUB_COMMON` `IN_SCOPE`, les 5 autres `OUT_OF_SCOPE`.
+* CSV unique **UTF-8/LF** (sur NAS) : `customerId;blockId;blockType;status;version`.
+
+## 3. Architecture (C4)
+
+{plantuml}
+@startuml
+!include \<C4/C4\_Container>
+title FTR-INITLOAD – C4 (L2)
+
+Person(ops, "Ops/Batch")
+System\_Boundary(go, "KYC Platform (GO)") {
+Container(batch, "InitLoad Batch", "Spring Batch", "Reader BDWH, Processor matrice, Writers DB/CSV")
+ContainerDb(db, "GO DB", "Oracle", "PARTY, BLOCK, BLOCK\_VERSION, SCOPE, STG\_SF")
+}
+System\_Ext(bdwh, "BDWH", "DWH", "Clients actifs IND")
+System\_Ext(sf, "Salesforce", "SaaS", "Conso CSV Blocks")
+
+Rel(ops, batch, "Planification/Run")
+Rel(batch, bdwh, "SELECT clients actifs")
+Rel(batch, db, "Upsert PARTY/BLOCK(SCD2-light), Scope/Rejeu")
+Rel(batch, sf, "CSV (NAS)", "UTF-8/LF; header")
+@enduml
+{plantuml}
+
+```plantuml
+@startuml
+title FTR-INITLOAD – C4 (fallback)
+actor Ops
+node "InitLoad Batch\n(Spring Batch)" as B
+database "GO DB\n(PARTY,BLOCK,BLOCK_VERSION,SCOPE,STG_SF)" as DB
+rectangle "BDWH" as DWH
+cloud "Salesforce" as SF
+
+Ops -> B : start
+B -> DWH : read active IND
+B -> DB : upsert PARTY/BLOCK
+B -> SF : export CSV (NAS)
+@enduml
+```
+
+## 4. Séquence principale
+
+{plantuml}
+@startuml
+title FTR-INITLOAD – Séquence Batch
+
+actor Scheduler
+participant BDWH
+participant "InitLoad Batch" as Job
+database "GO DB" as DB
+participant "CSV Writer" as CSV
+
+Scheduler -> Job : start(runTag)
+Job -> BDWH : readActiveIndividuals()
+BDWH --> Job : customers\[]
+loop for each customer
+Job -> DB : upsert PARTY (idempotent)
+Job -> DB : ensure Blocks per matrix (create if absent)
+Job -> DB : ensure BLOCK\_VERSION v1 (INITIALIZED/OOS)
+Job -> CSV : appendLine(customerId;blockId;blockType;status;version)
+end
+CSV --> Scheduler : file ready (tmp->rename)
+@enduml
+{plantuml}
+
+## 5. Modèle de données (diff)
+
+* **PARTY**(id, external\_ref, type, subtype, status).
+* **BLOCK**(id, party\_id, kind, current\_version\_id?, scope\_status `IN_SCOPE|OUT_OF_SCOPE`, **UQ(party\_id,kind)**).
+* **BLOCK\_VERSION**(id, block\_id, version\_no, state `INITIALIZED|APPROVED|…`, data\_json, created\_at, **UQ(block\_id,version\_no)**).
+* **INITLOAD\_SCOPE**(run\_tag, party\_external\_ref, status `PENDING|PROCESSED|ERROR`, error\_msg).
+* **SF\_BLOCKS\_STG** pour réconciliation (staging de l’extract SF).
+* Index recommandés : `BLOCK(party_id,kind)`, `BLOCK_VERSION(block_id,version_no)`.
+
+## 6. Sécurité & Privacy
+
+* CSV **sans PII** (IDs, types uniquement).
+* RBAC exécution batch ; secrets (BDWH/DB/NAS) en vault.
+* Validation stricte du format CSV ; horodatage et empreinte (checksum).
+
+## 7. Observabilité
+
+* Logs JSON corrélés `runTag`.
+* Métriques : `customers_processed`, `blocks_created`, `csv_rows_written`, `replay_skipped`, `errors`.
+* Alertes : échec step, fichier final manquant, lignes ERROR dans `INITLOAD_SCOPE`.
+
+## 8. Tests & critères d’acceptation (macro)
+
+* Unit : matrice Customer/Third-party, mapping BDWH→PARTY/BLOCK.
+* Intégration : idempotence (second run = 0 création).
+* E2E : CSV conforme ; volumétrie réaliste.
+* Perf : tenir la fenêtre week-end (400k).
+
+### Modèle — Vue métier (classes)
+
+{plantuml}
+@startuml
+title FTR-INITLOAD – Modèle de domaine (simplifié)
+class Party {
++id: String
++externalRef: String
++type: String // CUSTOMER|THIRD\_PARTY
++subType: String // IND
++status: String // ACTIVE|INACTIVE
+}
+class Block {
++id: String
++partyId: String
++kind: String
++scopeStatus: String // IN\_SCOPE|OUT\_OF\_SCOPE
++currentVersionId: String?
+}
+class BlockVersion {
++id: String
++blockId: String
++versionNo: int
++state: String // INITIALIZED|APPROVED|...
++dataJson: String
++createdAt: Instant
+}
+
+Party "1" o-- "0..*" Block
+Block "1" o-- "1..*" BlockVersion
+@enduml
+{plantuml}
+
+---
+
+### \[FR] SECTION 3 — Estimation – Haut niveau (avec descriptions)
+
+* **T-shirt global** : **M**
+
+| Poste                                             | SP | JH (plage) | Risque | Description                                          |
+| ------------------------------------------------- | -: | ---------: | ------ | ---------------------------------------------------- |
+| Reader BDWH (clients actifs IND)                  |  3 |      1–2 j | Faible | Source JDBC + filtres de statut, tests d’extraction. |
+| Processor matrice type→blocks                     |  3 |      1–2 j | Faible | Règles Customer/Third-party, mapping `IN_SCOPE/OOS`. |
+| Writer DB idempotent (PARTY/BLOCK/BLOCK\_VERSION) |  5 |      2–3 j | Moyen  | UQ métiers, upsert, SCD2-light, horodatage.          |
+| Writer CSV (NAS) + atomic rename                  |  5 |      2–3 j | Moyen  | `.tmp -> .csv` atomique, header, LF, checksum.       |
+| Table scope & rejouabilité                        |  3 |      1–2 j | Faible | `INITLOAD_SCOPE`, statuts, reprise après crash.      |
+| Réconciliation SF (staging + diff SQL)            |  5 |      2–3 j | Moyen  | Charger extract SF, anti-joins, alimenter scope.     |
+| Observabilité (logs/metrics/traces)               |  3 |      1–2 j | Faible | RED/USE, corrélation `runTag`, alertes.              |
+
+**Chemin critique** : Reader → Writer DB → Writer CSV → Réconciliation.
+
+---
+
+### \[FR] SECTION 4 — Risques, décisions, trade-offs
+
+* **Risques** : surcharge BDWH ; CSV incomplet ; cas limites (clients Third-party massifs).
+* **Mitigations** : pagination/partitioning ; fichiers `.tmp` + rename ; anti-joins de vérif ; dry-run.
+* **Décisions** : CSV vs API → **CSV** choisi (quasi-batch, peu de couplage) ; idempotence par UQ + skip.
+* **Trade-offs** : simplicité et robustesse > finesse temps réel.
+
+---
+
+---
+
+### \[FR] SECTION 1 — Confluence – Mini Blueprint (markdown + PlantUML)
+
+# FTR-ONBOARDING – Création & switch (Customer ↔ Third-party) avec double source + “création seulement si APPROVED”
+
+## 1. Contexte & objectif
+
+À l’onboarding ou lors d’un **changement de type**, aligner le **set de blocs** pour le client.
+**Règle clé** : si la **version courante** du bloc n’est **pas `APPROVED`**, **pas de création** de nouvelle version ; la création est autorisée **uniquement** quand la courante est `APPROVED`.
+Deux sources possibles (au choix) : **T24** (snapshot JSON) **ou** **Application d’Onboarding** (operation+snapshot). Mapping vers un **évènement canonique** interne.
+
+## 2. Portée
+
+**In** : adapters (T24/Onb) → `PartyLifecycleEvent`, orchestrateur Party, listeners par **BlockKind**, **Approved-Gate**, `OUT_OF_SCOPE` différé si non-`APPROVED`, outbox Salesforce.
+**Out** : UI, fermeture de party, suppression physique.
+**Hypothèses figées** : types `{CUSTOMER, THIRD_PARTY}`, subType `IND`; matrice identique à INITLOAD.
+
+## 3. Architecture (C4)
+
+{plantuml}
+@startuml
+!include \<C4/C4\_Container>
+title FTR-ONBOARDING – C4 (L2)
+
+Person(ops, "Ops/Support")
+System\_Boundary(go, "KYC Platform (GO)") {
+Container(app, "GO Monolith", "Spring Modulith", "Adapters (T24/Onb), Canonicalizer, Party Orchestrator, Block Listeners(Approved-Gate), SF Outbox")
+ContainerDb(db, "GO DB", "Oracle", "PARTY,BLOCK,BLOCK\_VERSION,EVENT\_INBOX,PARTY\_PROJECTION,DEFERRED\_SCOPE\_CHANGE,OUTBOX")
+}
+System\_Ext(t24, "T24", "Core", "JSON snapshot (key=partyId)")
+System\_Ext(onb, "Onboarding App", "Domain", "operation+snapshot (key=partyId)")
+System\_Ext(sf, "Salesforce", "SaaS", "Upsert bloc courant")
+
+Rel(t24, app, "Events JSON")
+Rel(onb, app, "Events op+snapshot")
+Rel(app, db, "Inbox/Projection/Domain writes")
+Rel(app, sf, "Outbox → Upsert", "async")
+@enduml
+{plantuml}
+
+```plantuml
+@startuml
+title FTR-ONBOARDING – séquence Approved-Gate
+actor Source
+participant Adapter
+database EVENT_INBOX as INB
+participant Canonicalizer as CAN
+participant Orchestrator as ORCH
+participant "Listeners[BlockKind]" as BL
+database GO_DB as DB
+participant "SF Outbox" as OUT
+
+Source -> Adapter : RawEvent{partyId, op?, snapshot, eventId, ts}
+Adapter -> INB : insert(unique) or skip duplicate
+Adapter -> CAN : mapToPartyLifecycleEvent()
+CAN -> ORCH : handle()
+ORCH -> BL : onPartyChanged(partyId,type,subType)
+
+loop per BlockKind
+  BL -> DB : read current block/version(state)
+  alt Desired = IN_SCOPE
+    alt current exists & state != APPROVED
+      BL -> DB : NO-OP (Approved-Gate)
+    else current exists & state = APPROVED
+      BL -> DB : create new version if needed (INITIALIZED)
+      BL -> OUT : BlockUpserted
+    else no current
+      BL -> DB : create block + v1 (INITIALIZED)
+      BL -> OUT : BlockUpserted
+    end
+  else Desired = OUT_OF_SCOPE
+    alt state = APPROVED
+      BL -> DB : set OUT_OF_SCOPE
+      BL -> OUT : BlockScopeChanged
+    else state != APPROVED
+      BL -> DB : record DeferredScopeChange
+    end
+  end
+end
+@enduml
+```
+
+## 5. Modèle de données (diff)
+
+* **EVENT\_INBOX**(source, event\_id **UQ**, party\_id, event\_ts, payload\_json, status).
+* **PARTY\_PROJECTION**(party\_id, last\_ts, type, subtype, status).
+* **BLOCK\_VERSION**(id, block\_id, version\_no, **state** `INITIALIZED|IN_REVIEW|LOCKED|APPROVED`, valid\_from, valid\_until).
+* **DEFERRED\_SCOPE\_CHANGE**(id, block\_id, target\_status=`OUT_OF_SCOPE`, reason, created\_at, applied\_at?).
+* **OUTBOX**(event\_type, aggregate\_id, dedupe\_key **UQ**, payload\_json, status, retry/backoff).
+* Index : `BLOCK_VERSION(block_id,state)`, `DEFERRED_SCOPE_CHANGE(block_id, applied_at)`.
+
+## 6. Sécurité & Privacy
+
+* RBAC par source ; secrets en vault ; logs **sans PII**.
+* Schémas versionnés + DLQ en cas d’event invalide.
+* STRIDE : ACL topics, audit Inbox/Outbox, backpressure.
+
+## 7. Observabilité
+
+* Logs décisionnels : `APPLIED|DUPLICATE|STALE|NO_OP_APPROVED_GATE|OOS_DEFERRED`.
+* Métriques : `events_received/applied`, `approved_gate_noop_total`, `deferred_scope_changes`, `outbox_pending`.
+* Traces : Adapter→Canonicalizer→Orchestrator→Listener.
+
+## 8. Tests & critères d’acceptation (macro)
+
+* Unit : mappers T24/Onb→canonique ; gate ; OOS différé.
+* Intégration : Inbox idempotence ; projection temporelle.
+* E2E : CREATE/ACTIVATE, SWITCH\_TO\_CUSTOMER/THIRDPARTY (avec courant APPROVED vs non).
+* Non-régression : replays/out-of-order sans duplication.
+
+### Modèle — Vue métier (classes)
+
+{plantuml}
+@startuml
+title FTR-ONBOARDING – Modèle de domaine (simplifié)
+class Party {
++id: String
++externalRef: String
++type: String
++subType: String
++status: String
+}
+class Block {
++id: String
++partyId: String
++kind: String
++scopeStatus: String
++currentVersionId: String?
+}
+class BlockVersion {
++id: String
++blockId: String
++versionNo: int
++state: String // INITIALIZED|IN\_REVIEW|LOCKED|APPROVED
++validFrom: Instant?
++validUntil: Instant?
++dataJson: String
+}
+
+Party "1" o-- "0..*" Block
+Block "1" o-- "1..*" BlockVersion
+@enduml
+{plantuml}
+
+---
+
+### \[FR] SECTION 3 — Estimation – Haut niveau (avec descriptions)
+
+* **T-shirt global** : **M**
+
+| Poste                               | SP | JH (plage) | Risque | Description                                                       |
+| ----------------------------------- | -: | ---------: | ------ | ----------------------------------------------------------------- |
+| Adapter T24 (snapshot JSON)         |  3 |      1–2 j | Moyen  | Consommer + valider schéma + mapping vers évènement canonique.    |
+| Adapter Onboarding (op+snapshot)    |  3 |      1–2 j | Faible | Même logique, opérations explicites (CREATE/UPDATE/SWITCH).       |
+| Inbox & Projection                  |  5 |      2–3 j | Moyen  | Idempotence (`UQ(source,event_id)`), `PARTY_PROJECTION(last_ts)`. |
+| Listeners BlockKind + Approved-Gate |  5 |      2–3 j | Moyen  | Matrice IN\_SCOPE/OOS + règle “création seulement si APPROVED”.   |
+| OOS différé                         |  3 |      1–2 j | Moyen  | Enregistrer puis appliquer à l’`APPROVED`.                        |
+| Outbox Salesforce                   |  5 |      2–3 j | Moyen  | Dédoublonnage, retry/backoff, métriques.                          |
+| Observabilité & DLQ                 |  3 |      1–2 j | Faible | Logs décisionnels, RED/USE, DLQ invalid events.                   |
+
+**Chemin critique** : Inbox/Projection → Listeners+Gate → OOS différé → Outbox.
+
+---
+
+### \[FR] SECTION 4 — Risques, décisions, trade-offs
+
+* **Risques** : divergence T24/Onb ; afflux d’events ; backlog outbox.
+* **Mitigations** : évènement canonique, partition par `partyId`, DLQ, alertes.
+* **Décisions** : **Approved-Gate** imposé ; `OUT_OF_SCOPE` soft ; dual-source **feature-flag**.
+* **Trade-offs** : cohérence ↑ (gate) vs réactivité ↓ (OOS différé).
+
+---
+
+## —————————————————————————————————————————————————————————————————
+
+### \[EN] SECTION 1 — Confluence – Mini Blueprint (markdown + PlantUML)
+
+# FTR-INITLOAD – Initialization of Blocks for existing customers
+
+## 1. Context & Goal
+
+Initialize **KYC/KYT blocks** for all **active individual** customers already in the bank, so GO and Salesforce share a **consistent reference state**.
+Expected output: **idempotent** block creation based on **type matrix**, **CSV** export for Salesforce, and **replay/reconciliation** mechanisms.
+
+## 2. Scope
+
+**In**: Spring Batch (BDWH reader, matrix processor, DB + CSV writers), idempotence (unique constraints), **scope** for re-runs, reconciliation (SF extract staging + SQL diff), observability.
+**Out**: UI, real-time, party close, physical deletions.
+**Frozen assumptions**:
+
+* Types: `CUSTOMER`, `THIRD_PARTY`; subType MVP: `IND`.
+* Matrix: `CUSTOMER` ⇒ 7 `IN_SCOPE` (`INITIALIZED`); `THIRD_PARTY` ⇒ `STATIC_DATA` + `DOC_IHUB_COMMON` `IN_SCOPE`, others `OUT_OF_SCOPE`.
+* Single CSV **UTF-8/LF**: `customerId;blockId;blockType;status;version`.
+
+## 3. Architecture (C4)
+
+{plantuml}
+@startuml
+!include \<C4/C4\_Container>
+title FTR-INITLOAD – C4 (L2, EN)
+
+Person(ops, "Ops/Batch")
+System\_Boundary(go, "KYC Platform (GO)") {
+Container(batch, "InitLoad Batch", "Spring Batch", "BDWH Reader, Matrix Processor, DB/CSV Writers")
+ContainerDb(db, "GO DB", "Oracle", "PARTY, BLOCK, BLOCK\_VERSION, SCOPE, STG\_SF")
+}
+System\_Ext(bdwh, "BDWH", "DWH", "Active IND customers")
+System\_Ext(sf, "Salesforce", "SaaS", "Consumes Blocks CSV")
+
+Rel(ops, batch, "Schedule/Run")
+Rel(batch, bdwh, "SELECT active individuals")
+Rel(batch, db, "Upsert PARTY/BLOCK, Scope/Replay")
+Rel(batch, sf, "CSV (NAS)", "UTF-8/LF; header")
+@enduml
+{plantuml}
+
+## 4. Main Sequence
+
+{plantuml}
+@startuml
+title FTR-INITLOAD – Batch Sequence (EN)
+
+actor Scheduler
+participant BDWH
+participant "InitLoad Batch" as Job
+database "GO DB" as DB
+participant "CSV Writer" as CSV
+
+Scheduler -> Job : start(runTag)
+Job -> BDWH : readActiveIndividuals()
+BDWH --> Job : customers\[]
+loop for each customer
+Job -> DB : upsert PARTY (idempotent)
+Job -> DB : ensure Blocks per matrix
+Job -> DB : ensure BLOCK\_VERSION v1
+Job -> CSV : appendLine(customerId;blockId;blockType;status;version)
+end
+CSV --> Scheduler : file ready (tmp->rename)
+@enduml
+{plantuml}
+
+## 5. Data Model (diff)
+
+As FR: PARTY, BLOCK, BLOCK\_VERSION, INITLOAD\_SCOPE, SF\_BLOCKS\_STG, with the same keys/indexes.
+
+## 6. Security & Privacy
+
+CSV **PII-free**; RBAC on batch; vault secrets; CSV validation and checksum.
+
+## 7. Observability
+
+JSON logs with `runTag`, RED/USE metrics, alerts on step failure / missing file / scope ERROR rows.
+
+## 8. Testing & Acceptance (macro)
+
+Unit (matrix), Integration (idempotent upsert), E2E (CSV), Performance (weekend window).
+
+### Model — Business View (classes)
+
+{plantuml}
+@startuml
+title FTR-INITLOAD – Domain Model (EN)
+class Party { +id; +externalRef; +type; +subType; +status }
+class Block { +id; +partyId; +kind; +scopeStatus; +currentVersionId? }
+class BlockVersion { +id; +blockId; +versionNo; +state; +dataJson; +createdAt }
+Party "1" o-- "0..*" Block
+Block "1" o-- "1..*" BlockVersion
+@enduml
+{plantuml}
+
+---
+
+### \[EN] SECTION 3 — High-level Estimation (with descriptions)
+
+* **Global T-shirt**: **M**
+
+| Work item            | SP | PH (range) | Risk | Description                                         |
+| -------------------- | -: | ---------: | ---- | --------------------------------------------------- |
+| BDWH Reader          |  3 |      1–2 d | Low  | JDBC source + status filters, extraction tests.     |
+| Type→Blocks Matrix   |  3 |      1–2 d | Low  | Customer/Third-party rules, `IN_SCOPE/OOS` mapping. |
+| Idempotent DB Writer |  5 |      2–3 d | Med  | Business UQs, upsert, SCD2-light.                   |
+| CSV Writer (NAS)     |  5 |      2–3 d | Med  | `.tmp → .csv` atomic rename, header, LF, checksum.  |
+| Scope & Replay       |  3 |      1–2 d | Low  | `INITLOAD_SCOPE` run state + recovery.              |
+| SF Reconciliation    |  5 |      2–3 d | Med  | Stage SF extract, diffs, scope feeding.             |
+| Observability        |  3 |      1–2 d | Low  | JSON decision logs, metrics, traces, alerts.        |
+
+---
+
+### \[EN] SECTION 4 — Risks, Decisions, Trade-offs
+
+* **Risks**: BDWH load, corrupted CSV, Third-party skew.
+* **Mitigations**: partitioning, tmp→rename, validation, anti-join verification.
+* **Decisions**: **CSV** over API (batch-friendly); idempotence via UQs + skip.
+* **Trade-offs**: simplicity & robustness over real-time fidelity.
+
+---
+
+---
+
+### \[EN] SECTION 1 — Confluence – Mini Blueprint (markdown + PlantUML)
+
+# FTR-ONBOARDING – Create & switch (Customer ↔ Third-party) with dual source + “create only if APPROVED”
+
+## 1. Context & Goal
+
+On onboarding or **type switch**, align the **customer’s block set**.
+**Key rule**: if the **current block version** is **not `APPROVED`**, **do not create** a new one; creation is allowed **only** when current is `APPROVED`.
+Two optional sources: **T24** (snapshot JSON) **or** **Onboarding App** (operation+snapshot). Both map to a **canonical internal event**.
+
+## 2. Scope
+
+**In**: adapters (T24/Onb) → `PartyLifecycleEvent`, Party orchestrator, **BlockKind** listeners, **Approved-Gate**, **deferred OUT\_OF\_SCOPE** if not `APPROVED`, SF outbox.
+**Out**: UI, party closure, physical deletes.
+**Frozen assumptions**: types `{CUSTOMER, THIRD_PARTY}`, subType `IND`; same matrix as INITLOAD.
+
+## 3. Architecture (C4)
+
+{plantuml}
+@startuml
+!include \<C4/C4\_Container>
+title FTR-ONBOARDING – C4 (L2, EN)
+
+Person(ops, "Ops/Support")
+System\_Boundary(go, "KYC Platform (GO)") {
+Container(app, "GO Monolith", "Spring Modulith", "Adapters, Canonicalizer, Party Orchestrator, Block Listeners (Approved-Gate), SF Outbox")
+ContainerDb(db, "GO DB", "Oracle", "PARTY,BLOCK,BLOCK\_VERSION,EVENT\_INBOX,PARTY\_PROJECTION,DEFERRED\_SCOPE\_CHANGE,OUTBOX")
+}
+System\_Ext(t24, "T24", "Core", "JSON snapshot")
+System\_Ext(onb, "Onboarding App", "Domain", "operation+snapshot")
+System\_Ext(sf, "Salesforce", "SaaS", "Upsert current block")
+
+Rel(t24, app, "JSON events (partyId)")
+Rel(onb, app, "op+snapshot events (partyId)")
+Rel(app, db, "Inbox/Projection/Domain writes")
+Rel(app, sf, "Outbox → Upsert", "async")
+@enduml
+{plantuml}
+
+## 4. Main Sequence
+
+{plantuml}
+@startuml
+title FTR-ONBOARDING – Sequence (Approved-Gate)
+
+actor Source
+participant Adapter
+database EVENT\_INBOX as INB
+participant Canonicalizer as CAN
+participant Orchestrator as ORCH
+participant "Listeners\[BlockKind]" as BL
+database GO\_DB as DB
+participant "SF Outbox" as OUT
+
+Source -> Adapter : RawEvent
+Adapter -> INB : insert(unique) or skip
+Adapter -> CAN : canonicalize
+CAN -> ORCH : handle(event)
+ORCH -> BL : onPartyChanged(...)
+
+loop per BlockKind
+BL -> DB : load current/version state
+alt IN\_SCOPE
+alt exists & state != APPROVED
+BL -> DB : NO-OP (Approved-Gate)
+else exists & state = APPROVED
+BL -> DB : create new version if needed
+BL -> OUT : BlockUpserted
+else not exists
+BL -> DB : create block + v1
+BL -> OUT : BlockUpserted
+end
+else OUT\_OF\_SCOPE
+alt state = APPROVED
+BL -> DB : set OUT\_OF\_SCOPE
+BL -> OUT : BlockScopeChanged
+else
+BL -> DB : record DeferredScopeChange
+end
+end
+end
+@enduml
+{plantuml}
+
+## 5. Data Model (diff)
+
+As FR: EVENT\_INBOX, PARTY\_PROJECTION, BLOCK\_VERSION (with `state` & validity), DEFERRED\_SCOPE\_CHANGE, OUTBOX; same keys/indexes.
+
+## 6. Security & Privacy
+
+RBAC per source; vault secrets; **no PII** in logs; versioned schemas, DLQ.
+
+## 7. Observability
+
+Decision logs (`APPLIED|DUPLICATE|STALE|NO_OP_APPROVED_GATE|OOS_DEFERRED`), metrics, traces, alerts on deferred/outbox backlogs.
+
+## 8. Testing & Acceptance (macro)
+
+Unit (mappers, gate, deferred OOS), Integration (Inbox+Projection), E2E (create/switch with current APPROVED vs not), Non-regression (replays/out-of-order).
+
+### Model — Business View (classes)
+
+{plantuml}
+@startuml
+title FTR-ONBOARDING – Domain Model (EN)
+class Party { +id; +externalRef; +type; +subType; +status }
+class Block { +id; +partyId; +kind; +scopeStatus; +currentVersionId? }
+class BlockVersion { +id; +blockId; +versionNo; +state; +validFrom?; +validUntil?; +dataJson }
+Party "1" o-- "0..*" Block
+Block "1" o-- "1..*" BlockVersion
+@enduml
+{plantuml}
+
+---
+
+### \[EN] SECTION 3 — High-level Estimation (with descriptions)
+
+* **Global T-shirt**: **M**
+
+| Work item                  | SP | PH (range) | Risk | Description                                       |
+| -------------------------- | -: | ---------: | ---- | ------------------------------------------------- |
+| T24 Adapter                |  3 |      1–2 d | Med  | Ingest + schema validation + canonical mapping.   |
+| Onboarding Adapter         |  3 |      1–2 d | Low  | Same; explicit operations (CREATE/UPDATE/SWITCH). |
+| Inbox & Projection         |  5 |      2–3 d | Med  | Idempotency (UQ), temporal projection.            |
+| BlockKind Listeners + Gate |  5 |      2–3 d | Med  | Matrix IN\_SCOPE/OOS + “create only if APPROVED”. |
+| Deferred OOS               |  3 |      1–2 d | Med  | Record and apply at APPROVED.                     |
+| SF Outbox                  |  5 |      2–3 d | Med  | Dedup, retry/backoff, metrics.                    |
+| Observability & DLQ        |  3 |      1–2 d | Low  | Decision logs, RED/USE metrics, traces, alerts.   |
+
+---
+
+### \[EN] SECTION 4 — Risks, Decisions, Trade-offs
+
+* **Risks**: T24 vs Onb semantics drift; event bursts; outbox backlog.
+* **Mitigations**: canonical event, key partitioning by `partyId`, DLQ, alerts.
+* **Decisions**: **Approved-Gate** enforced; `OUT_OF_SCOPE` soft; dual-source feature-flag.
+* **Trade-offs**: stronger consistency via the gate, at the expense of immediacy for OOS.
+
+---
+
+Si tu veux, je peux intégrer ces sections dans tes espaces Confluence (mêmes diagrammes PlantUML) ou t’ajouter des **snippets SQL/JPA** pour les modèles (`BLOCK`, `BLOCK_VERSION`, `DEFERRED_SCOPE_CHANGE`, etc.).
