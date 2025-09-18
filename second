@@ -1,0 +1,336 @@
+### \[FR] SECTION 1 — Confluence – Mini Blueprint (markdown + PlantUML)
+
+# FTR-HIT-ONECALL — Revue « one-call » : Hit → Review → Famille → Blocs → Salesforce (sans évènements internes)
+
+## 1. Contexte & objectif
+
+Nous remplaçons la chorégraphie par évènements internes par une **orchestration en un seul appel** : un hit déclenche un **service unique** qui ouvre la review, récupère la famille **par pages**, crée/actualise les blocs **par paquets**, et alimente une **file de sortie** vers Salesforce.
+Objectifs : **idempotence**, **reprise** en cas d’arrêt, **maîtrise de la volumétrie** (jusqu’à \~400 membres ≈ \~2 800 blocs) et **observabilité**.
+
+## 2. Portée
+
+**Inclus**
+
+* Point d’entrée unique `processHit()` (appelé par iHub / middleware).
+* Ouverture ou récupération d’une **seule review active** par client.
+* Récupération **paginée** des membres de famille.
+* Création/MAJ des blocs en **paquets** (historisation par nouvelle ligne + porte “version courante approuvée”).
+* **Table de travail** pour mémoriser la progression et permettre la **reprise**.
+* **File de sortie** locale vers Salesforce (envoi asynchrone, relance).
+* Idempotence : déduplication du hit (clé stable) + déduplication des sorties.
+
+**Hors périmètre (MVP)** : interface utilisateur, moteur de règles avancées, clôture de partie, archivage légal complet.
+
+**Hypothèses figées**
+
+* Une seule review **active** par client (contrainte d’unicité conditionnelle).
+* Famille fournie par une API externe paginée.
+* Création d’une nouvelle version de bloc **seulement si** la version courante est **approuvée** ; sinon **réutilisation**.
+* Possibilité de répondre **202 Accepted** avec `workId` si le traitement dépasse un seuil (puis reprise).
+
+## 3. Architecture (C4)
+
+{plantuml}
+@startuml
+!include \<C4/C4\_Container>
+title FTR-HIT-ONECALL – C4 (L2)
+
+Person(ops, "KYCO / Ops")
+System\_Boundary(go, "Global Orchestrator") {
+Container(api, "Hit Orchestrator API", "Spring", "processHit(): ouvre/reprend, boucle familles, crée blocs par paquets")
+Container(review, "Review Manager", "Spring", "Une review active par client, états simples")
+Container(fam, "Family Client", "Spring", "Récupère la famille par pages, limite de débit")
+Container(blocks, "Block Manager", "Spring", "SCD2, porte 'courant approuvé', attache à la review")
+Container(outbox, "Salesforce Outbox", "Spring", "File locale, relance, déduplication par identifiant")
+ContainerDb(db, "Base GO (Oracle)", "HIT\_INBOX, REVIEW\_INSTANCE, REVIEW\_WORK, PARTY, BLOCK, BLOCK\_VERSION, REVIEW\_TARGET, ROLE\_BLOCK\_POLICY, OUTBOX")
+}
+System\_Ext(ihub, "iHub", "Publie le hit / appelle l’API")
+System\_Ext(sf, "Salesforce", "Reçoit les upserts")
+System\_Ext(fapi, "API Famille", "Fournit les membres paginés")
+
+Rel(ihub, api, "POST processHit(hitKey, partyId)")
+Rel(api, review, "openOrGetReview()")
+Rel(api, fam, "fetchFamily(page,size)")
+Rel(api, blocks, "createOrReuse(versionnée; paquet)")
+Rel(api, outbox, "enqueue upserts (par paquet)")
+Rel(go, db, "R/W")
+Rel(outbox, sf, "Upsert asynchrone")
+@enduml
+{plantuml}
+
+```plantuml
+@startuml
+title C4 fallback — FTR-HIT-ONECALL
+actor iHub
+participant "Hit Orchestrator" as ORCH
+participant "Review Manager" as REV
+participant "Family Client" as FAM
+participant "Block Manager" as BLK
+queue "Outbox→Salesforce" as OUT
+database "GO DB" as DB
+
+iHub -> ORCH: processHit(hitKey, partyId)
+ORCH -> REV: openOrGet(partyId, hitKey)
+loop pages
+  ORCH -> FAM: fetch(page, size)
+  FAM --> ORCH: members[]
+  ORCH -> BLK: upsert blocks (batch)
+  BLK -> DB: SCD2 + attach review
+  ORCH -> OUT: enqueue upserts (batch)
+end
+ORCH --> iHub: 200 OK ou 202 Accepted (workId)
+@enduml
+```
+
+## 4. Séquence principale
+
+{plantuml}
+@startuml
+title FTR-HIT-ONECALL — Séquence détaillée (with chunks)
+
+participant "iHub" as IH
+participant "Orchestrator" as ORCH
+participant "ReviewMgr" as REV
+participant "FamilyAPI" as FAM
+participant "BlockMgr" as BLK
+participant "Outbox" as OUT
+database "DB" as DB
+
+IH -> ORCH: processHit(hitKey, partyId)
+ORCH -> DB: HIT\_INBOX insertIfAbsent(hitKey)
+ORCH -> REV: openOrGetReview(partyId)
+ORCH -> DB: REVIEW\_WORK loadOrInit(reviewId, partyId)
+
+loop while more pages
+ORCH -> FAM: getMembers(page,size,throttle)
+FAM --> ORCH: members\[]
+ORCH -> BLK: upsertBatch(reviewId, members\[])  'porte approuvé + SCD2
+BLK -> DB: batch writes (versions, targets)
+ORCH -> OUT: enqueueBatch(upserts)
+ORCH -> DB: REVIEW\_WORK markProgress(lastIndex)
+end
+
+ORCH -> DB: REVIEW\_WORK markDone()
+ORCH --> IH: 200 OK
+@enduml
+{plantuml}
+
+## 5. Modèle de données (diff)
+
+* **HIT\_INBOX**(source, hit\_key, payload\_json, received\_at, **UQ(source, hit\_key)**).
+* **REVIEW\_INSTANCE**(id, party\_id, status, started\_at). **Unicité “active”** via index fonctionnel : unique sur `party_id` si `status in ('OPEN','IN_PROGRESS')`.
+* **REVIEW\_WORK**(id, review\_id, party\_id, status=`RUNNING|DONE|ERROR`, last\_member\_index, last\_updated\_at, error\_msg?).
+* **ROLE\_BLOCK\_POLICY**(id, role, block\_kind, policy, priority, valid\_from, valid\_to).
+* **BLOCK**(id, party\_id, kind, current\_version\_id, **UQ(party\_id,kind)**).
+* **BLOCK\_VERSION**(id, block\_id, version\_no, state, valid\_from, valid\_until, data\_json).
+* **REVIEW\_TARGET**(id, review\_id, block\_version\_id, subject\_party\_id, role).
+* **OUTBOX**(id, event\_type, external\_id, dedupe\_key, payload\_json, attempts, next\_run\_at, last\_error, status).
+
+## 6. Sécurité & Privacy
+
+* Authentifier l’appelant du point d’entrée ; limiter par client.
+* Aucune donnée personnelle superflue dans journaux et messages de sortie.
+* Chiffrement au repos (base) et en transit (TLS).
+* Journal d’audit minimal : qui a déclenché, quand, combien d’éléments traités.
+
+## 7. Observabilité
+
+* Journaux structurés : **décisions** (review récupérée/ouverte, “porte approuvée ⇒ pas de nouvelle version”), **progression** (index, pages), **envois**.
+* Mesures : `members_processed`, `blocks_upserted`, `gate_noop_total`, `outbox_pending`, `outbox_retry`, latence “appel → fin”.
+* Traces : spans par page et par paquet, corrélées par `partyId` et `reviewId`.
+* Alertes : backlog de la file de sortie, part d’échecs par page, temps moyen par paquet.
+
+## 8. Tests & critères d’acceptation (macro)
+
+* Unitaire : règles rôle→blocs ; porte “courant approuvé” ; génération de versions (numérotation, clôture `valid_until`).
+* Intégration : récupération famille paginée avec limites ; écriture **par paquets** ; reprise depuis `REVIEW_WORK`.
+* Bout-en-bout : hit idempotent ; review unique active ; famille 400+ ; blocs \~2 800 créés/attachés ; envoi vers Salesforce en file locale.
+* Performance : calibrage `pageSize` et taille de paquets de blocs (insert/update groupés).
+
+---
+
+### \[FR] SECTION 3 — Estimation – Haut niveau (adaptée au « one-call »)
+
+* **T-shirt global** : **L**
+
+| Lot (concret)                                | Ce qui est livré                                                                                 | Jours min | Jours probable | Jours max | Moyenne (PERT) | Risques/points durs                                                    |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------ | --------: | -------------: | --------: | -------------: | ---------------------------------------------------------------------- |
+| Point d’entrée `processHit()` + idempotence  | Contrat, contrôle d’accès, insertion anti-doublon, corrélation                                   |       1.0 |            1.5 |       2.0 |        **1.6** | Contrat amont, clés stables                                            |
+| Ouverture/contrainte « une review active »   | Index fonctionnel, gestion “ouvrir ou récupérer”, états simples                                  |       1.5 |            2.0 |       3.0 |        **2.1** | Index conditionnel Oracle                                              |
+| Client famille paginé + limite de débit      | Pages paramétrables, temps d’attente, erreurs partielles                                         |       2.0 |            3.0 |       4.5 |        **3.1** | Volumétrie 400+, cohérence pages                                       |
+| Table de travail & reprise (`REVIEW_WORK`)   | Init/lecture, mise à jour de progression, reprise après arrêt                                    |       1.0 |            1.5 |       2.5 |        **1.6** | Cas de reprise concurrente                                             |
+| Gestion blocs par paquets (SCD2 + porte)     | Lecture courante, clôture ancienne, création nouvelle, attache review, écriture groupée          |       3.0 |            4.0 |       6.0 |        **4.2** | Courses d’écriture, taille des paquets                                 |
+| File de sortie vers Salesforce (asynchrone)  | Enqueue par paquets, clé de déduplication stable, relance avec attente progressive et dispersion |       2.0 |            2.5 |       3.5 |        **2.7** | Pannes/quota côté Salesforce                                           |
+| Gestion des réponses longues (202 + reprise) | Temps max par appel, retour `workId`, route de reprise                                           |       0.5 |            1.0 |       1.5 |        **1.0** | UX d’intégration amont                                                 |
+| Observabilité (journaux, mesures, traces)    | Tableaux de bord, jauges progression, alertes backlog                                            |       1.0 |            1.5 |       2.0 |        **1.6** | Choix des seuils                                                       |
+| **Total**                                    |                                                                                                  |  **12.0** |       **17.0** |  **25.0** |       **18.0** | Chemin critique : famille paginée → blocs par paquets → file de sortie |
+
+> Les “jours” sont par développeur, hors validation métier et qualification.
+
+---
+
+### \[FR] SECTION 4 — Risques, décisions, trade-offs
+
+* **Risques clés**
+
+  * Familles très volumineuses : temps d’appel trop long → **réponse 202 + reprise** et pageSize ajustable.
+  * Conflits lors de la création de versions : **porte “courant approuvé”** + contrôles d’unicité.
+  * Backlog Salesforce : **file de sortie** avec relance et journal d’erreurs.
+
+* **Décisions d’architecture**
+
+  * **Orchestration “one-call”** avec **paquets** au lieu d’évènements internes.
+  * **Table de travail** pour la **reprise**.
+  * **File de sortie** unique pour toutes les synchronisations externes.
+  * **Porte “courant approuvé”** avant toute nouvelle version.
+
+* **Compromis**
+
+  * Simplicité d’exploitation ↑ (moins d’évènements) vs nécessité de gérer **réponse 202** et **reprise**.
+  * Transaction courte et répétée par paquets vs plus de code de **progression**.
+
+---
+
+## Annexes — Modèle de domaine (PlantUML)
+
+{plantuml}
+@startuml
+title Domaine — FTR-HIT-ONECALL
+
+class HitInbox {+source;+hitKey;+receivedAt;+payloadJson}
+class ReviewInstance {+id;+partyId;+status;+startedAt}
+class ReviewWork {+id;+reviewId;+partyId;+status;+lastMemberIndex;+lastUpdatedAt;+errorMsg?}
+class RoleBlockPolicy {+id;+role;+blockKind;+policy;+priority;+validFrom;+validTo}
+class Block {+id;+partyId;+kind;+currentVersionId}
+class BlockVersion {+id;+blockId;+versionNo;+state;+validFrom;+validUntil;+dataJson}
+class ReviewTarget {+id;+reviewId;+blockVersionId;+subjectPartyId;+role}
+class Outbox {+id;+eventType;+externalId;+dedupeKey;+payloadJson;+attempts;+nextRunAt;+lastError;+status}
+
+ReviewInstance "1" o-- "0..*" ReviewWork
+ReviewInstance "1" o-- "0..*" ReviewTarget
+Block "1" o-- "1..\*" BlockVersion
+RoleBlockPolicy ..> ReviewTarget : détermine les blocs par rôle
+@enduml
+{plantuml}
+
+---
+
+## ————————————————————————————————————————————————————————
+
+### \[EN] SECTION 1 — Confluence – Mini Blueprint (markdown + PlantUML)
+
+# FTR-HIT-ONECALL — “One-call” Review: Hit → Review → Family → Blocks → Salesforce (no internal events)
+
+## 1. Context & Goal
+
+We replace internal choreography with a **single-call orchestration**: a hit triggers **one service** that opens the review, fetches family **by pages**, upserts blocks **in batches**, and feeds an **internal outbound queue** to Salesforce.
+Goals: **idempotency**, **resume** after interruptions, **controlled volume** (\~400 members ≈ \~2,800 blocks), and **observability**.
+
+## 2. Scope
+
+**In**: single entrypoint; one active review per customer; paged family retrieval; batch block upserts (type-2 history + “current approved” gate); work table for progress; outbound queue to Salesforce.
+**Out**: UI, advanced rule engine, party closure.
+
+**Frozen assumptions**: one active review per customer; family via paged external API; new block version **only if** current is **approved**; may return **202 Accepted** with `workId` when time exceeds threshold.
+
+## 3. Architecture (C4)
+
+{plantuml}
+@startuml
+!include \<C4/C4\_Container>
+title FTR-HIT-ONECALL – C4 (L2, EN)
+
+System\_Boundary(go, "Global Orchestrator") {
+Container(api, "Hit Orchestrator API", "Spring", "processHit(): open/resume, loop pages, batch blocks")
+Container(review, "Review Manager", "Spring", "One active review per customer")
+Container(fam, "Family Client", "Spring", "Paged retrieval, throttling")
+Container(blocks, "Block Manager", "Spring", "Type-2 history, approved-gate, review attach")
+Container(outbox, "Salesforce Outbox", "Spring", "Local queue, retry, dedup")
+ContainerDb(db, "GO DB", "HIT\_INBOX, REVIEW\_INSTANCE, REVIEW\_WORK, PARTY, BLOCK, BLOCK\_VERSION, REVIEW\_TARGET, ROLE\_BLOCK\_POLICY, OUTBOX")
+}
+System\_Ext(ihub, "iHub", "Calls the API")
+System\_Ext(sf, "Salesforce", "Receives upserts")
+System\_Ext(fapi, "Family API", "Paged members")
+
+@enduml
+{plantuml}
+
+## 4. Main Sequence
+
+{plantuml}
+@startuml
+title FTR-HIT-ONECALL — Main sequence (with chunks)
+
+actor iHub as IH
+participant Orchestrator as ORCH
+participant ReviewMgr as REV
+participant FamilyAPI as FAM
+participant BlockMgr as BLK
+queue Outbox as OUT
+database DB as DB
+
+IH -> ORCH: processHit(hitKey, partyId)
+ORCH -> DB: insertIfAbsent HIT\_INBOX
+ORCH -> REV: openOrGetReview
+ORCH -> DB: loadOrInit REVIEW\_WORK
+loop pages
+ORCH -> FAM: fetch(page,size)
+FAM --> ORCH: members\[]
+ORCH -> BLK: batch upserts (gate + type-2)
+BLK -> DB: batch writes
+ORCH -> OUT: enqueue batch
+ORCH -> DB: mark progress
+end
+ORCH -> DB: mark done
+ORCH --> IH: 200 OK or 202 Accepted(workId)
+@enduml
+{plantuml}
+
+## 5. Data Model (diff)
+
+Same as FR: `HIT_INBOX`, `REVIEW_INSTANCE`, `REVIEW_WORK`, `ROLE_BLOCK_POLICY`, `BLOCK`, `BLOCK_VERSION`, `REVIEW_TARGET`, `OUTBOX`.
+
+## 6. Security & Privacy
+
+Authenticate caller; no unnecessary personal data in logs/messages; encryption in transit/at rest; audit who/when/how many items processed.
+
+## 7. Observability
+
+Decision logs, progress logs (page/index), outbound metrics; traces per page and batch; alerts on outbound backlog and long batch times.
+
+## 8. Testing & Acceptance (macro)
+
+Unit (role→block, gate, versioning); Integration (paged family, batch writes, resume); E2E (idempotent hit, one active review, \~2,800 blocks, outbound queue resilience); Performance (tune page size and batch sizes).
+
+---
+
+### \[EN] SECTION 3 — High-level Estimation (one-call)
+
+* **Global T-shirt**: **L**
+
+| Work item                         | Delivered                                                       |    Min d | Likely d |    Max d | Avg (PERT) | Risks                                           |
+| --------------------------------- | --------------------------------------------------------------- | -------: | -------: | -------: | ---------: | ----------------------------------------------- |
+| `processHit()` + idempotency      | Contract, access control, dedupe insert, correlation            |      1.0 |      1.5 |      2.0 |    **1.6** | Stable keys                                     |
+| One active review                 | Functional unique index, open-or-get, simple states             |      1.5 |      2.0 |      3.0 |    **2.1** | Conditional index                               |
+| Paged family client + throttling  | Configurable pages, waits, partial failures                     |      2.0 |      3.0 |      4.5 |    **3.1** | 400+ members                                    |
+| Work table & resume               | Init/load, progress, resume after stop                          |      1.0 |      1.5 |      2.5 |    **1.6** | Concurrency on resume                           |
+| Batch blocks (type-2 + gate)      | Current read/close/create, attach review, grouped writes        |      3.0 |      4.0 |      6.0 |    **4.2** | Races, batch sizes                              |
+| Outbound queue to Salesforce      | Batch enqueue, stable dedupe key, retry with backoff and jitter |      2.0 |      2.5 |      3.5 |    **2.7** | Partner limits                                  |
+| Long call handling (202 + resume) | Max duration, `workId`, resume endpoint                         |      0.5 |      1.0 |      1.5 |    **1.0** | Upstream UX                                     |
+| Observability                     | Dashboards, progress gauges, backlog alerts                     |      1.0 |      1.5 |      2.0 |    **1.6** | Threshold tuning                                |
+| **Total**                         |                                                                 | **12.0** | **17.0** | **25.0** |   **18.0** | Critical path: family → batch blocks → outbound |
+
+---
+
+### \[EN] SECTION 4 — Risks, Decisions, Trade-offs
+
+* **Risks**: large families (long calls), version races, Salesforce backlog.
+* **Decisions**: single-call orchestration with chunks; work table for resume; single outbound queue; “current approved” gate.
+* **Trade-offs**: simpler runtime (no internal events) vs implementing 202 + resume flow; many short transactions vs progress bookkeeping.
+
+---
+
+Souhaite-tu que je t’ajoute :
+
+* le **contrat d’API** `processHit()` (schéma d’entrée/sortie, codes, exemple 202+reprise),
+* et le **DDL Oracle** prêt à exécuter pour `REVIEW_WORK`, `HIT_INBOX`, l’index fonctionnel “review active”, et la clé d’unicité `(party_id, kind)` ?
