@@ -1,0 +1,221 @@
+Très bon point 👌. Si un **hit** peut déclencher jusqu’à **400 membres** (≈ **2 800 blocs** à traiter), éviter une pluie d’événements internes est judicieux. Voilà une approche **“one-call orchestré”** qui garde la robustesse (idempotence, reprise) sans inonder le bus.
+
+# ✅ Recommandation : « Single-call Orchestrator » à **chunks** (sans événements internes)
+
+* **Un seul appel** côté module Hit : `HitService.process(startReviewCmd)`
+* À l’intérieur, **orchestration synchrone** (appel direct) : Review → Famille → Blocks, **par paquets** (chunks) de membres/blocs, avec **commits intermédiaires**.
+* **Sans ApplicationEvents** pour les étapes internes ; on garde **Outbox** uniquement pour Salesforce.
+* **Idempotence & reprise** grâce à une table de **travail** qui mémorise la progression.
+
+---
+
+## Architecture logique
+
+* `HitService` (orchestrateur synchrone)
+
+  * `ReviewManager` (ouvrir/retrouver la review active)
+  * `FamilyClient` (fetch famille en **pages**)
+  * `BlockManager` (SCD2 + gate) en **JDBC batch**
+  * `OutboxWriter` (regroupe/compresse les envois SF)
+  * `WorkRepo` (progression)
+
+**Transaction** : courte, **par chunk**, pas une énorme transaction unique.
+
+---
+
+## Tables techniques minimales
+
+* **REVIEW\_WORK**
+  `work_id (PK)`, `review_id`, `party_id`, `status (RUNNING|DONE|ERROR)`,
+  `last_member_idx`, `last_block_idx`, `updated_at`, `error_msg?`
+  → permet la **reprise** au prochain appel (ou relance manuelle).
+
+* **OUTBOX** (existante)
+  `event_type`, `external_id`, `dedupe_key`, `payload`, `attempts`, `next_run_at`, `last_error`
+  → **envoi asynchrone** vers Salesforce uniquement (pas d’événements internes).
+
+---
+
+## Flux (synchrone, par paquets)
+
+1. **Check idempotence** du hit (inbox anti-doublon, ou UQ `review_external_id`)
+2. **Ouvrir / récupérer** la review (garantie : une seule active par client)
+3. **Famille paginée** : récupérer `N` membres (ex. 100)
+4. **Pour chaque membre du chunk** : calculer les blocs à traiter (règle rôle→blocs)
+5. **Créer/MàJ les blocs par type**, en **batch JDBC** (SCD2 + gate)
+6. **Enqueue** dans l’**Outbox** les upserts SF (un par bloc **ou** agrégé par membre)
+7. **Commit** du chunk + **progression** (`last_member_idx`) dans `REVIEW_WORK`
+8. Boucler (page suivante) jusqu’à fin ; marquer **DONE**
+
+> En cas d’erreur dans un chunk, on **rollback** ce chunk, on logge `ERROR` dans `REVIEW_WORK`, et on peut **relancer** : l’orchestrateur reprendra au **dernier index** confirmé.
+
+---
+
+## Pourquoi ça tient la charge
+
+* **Pas d’ApplicationEvents** pour 2 800 blocs → zéro surcharge “pub/sub” interne.
+* **Chunking** (ex. 100 membres) ⇒ transactions **courtes**, mémoire bornée.
+* **Batch JDBC** ⇒ **moins d’allers/retours** vers la base.
+* **Outbox unique** ⇒ backpressure côté Salesforce sans bloquer la création des blocs.
+
+---
+
+## Détails d’implémentation (pratico-pratique)
+
+### 1) Signature de la commande
+
+```java
+record StartReviewCommand(String reviewExternalId, String partyId, Map<String,Object> attrs) {}
+```
+
+### 2) Orchestration « single-call » (pseudo-code)
+
+```java
+@Transactional(noRollbackFor = ProgressSaved.class)
+public void process(StartReviewCommand cmd) {
+  var review = reviewManager.openOrGet(cmd.partyId(), cmd.reviewExternalId()); // UQ "one active"
+
+  var work = workRepo.loadOrInit(review.id(), cmd.partyId());
+  int pageSize = config.familyPageSize(); // ex. 100
+  int page = work.lastMemberIdx() / pageSize;
+
+  while (true) {
+    var members = familyClient.fetchPage(cmd.partyId(), page, pageSize);
+    if (members.isEmpty()) break;
+
+    processChunk(review, members, work);   // fait ses propres mini-transactions
+    work = workRepo.markProgress(work, (page+1)*pageSize);
+    page++;
+  }
+
+  workRepo.markDone(work);
+}
+```
+
+### 3) Traitement d’un chunk (transactions **courtes**)
+
+```java
+@Transactional
+void processChunk(Review review, List<Member> members, ReviewWork work) {
+  var blockOps = new ArrayList<BlockUpsertOp>();
+
+  for (Member m : members) {
+    var plan = rolePolicy.resolveBlocksFor(m.roles());
+    for (BlockKind kind : plan.inScope()) {
+      var op = blocks.createOrReuseApprovedCurrent(review, m.partyId(), kind);
+      if (op.isNewOrChanged()) {
+        blockOps.add(op.toUpsertMessage()); // à pousser vers SF
+      }
+    }
+  }
+
+  outboxWriter.enqueueBatch(blockOps);  // écriture outbox (dedupe key stable)
+}
+```
+
+### 4) SCD2 + Gate (sans événements)
+
+```java
+Optional<BlockVersion> createOrReuseApprovedCurrent(Review review, String partyId, BlockKind kind) {
+  var block = blockRepo.findOrCreate(partyId, kind);
+  var current = blockRepo.loadCurrentVersion(block.id());
+
+  if (current != null && !current.state().isApproved()) {
+    metrics.increment("gate_noop", "kind", kind.name());
+    return Optional.empty(); // réutilisé par la review via REVIEW_TARGET si besoin
+  }
+
+  // historiser l’ancienne version si existante
+  if (current != null) blockRepo.closeVersion(current.id(), now());
+
+  // créer v+1
+  var next = blockRepo.createVersion(block.id(), current == null ? 1 : current.versionNo() + 1, initialState(kind));
+  blockRepo.setCurrent(block.id(), next.id());
+  reviewTargetRepo.attach(review.id(), next.id(), partyId, subjectRole(review, partyId));
+  return Optional.of(next);
+}
+```
+
+---
+
+## Performances & sécurité d’exécution
+
+* **Pagination famille** configurable (ex. 50/100/200).
+* **Batches JDBC** (insert/update) de 200–500 opérations → à ajuster par mesure.
+* **Limitation de débit** côté famille (si API externe), avec **attente** entre pages.
+* **Timeout global** par appel (ex. 30–60 s) : si on dépasse, on retourne **202 Accepted** avec `work_id`, et on documente une **relance** par API (`POST /hits/{id}/resume`) qui **reprend** via `REVIEW_WORK`.
+  (Alternative : laisser le même `POST /hits` être idempotent et reprenable s’il est rejoué avec la même clé)
+
+---
+
+## Idempotence & reprise
+
+* Idempotence du **hit** par `(source, reviewExternalId)` ou `(partyId, reviewExternalId)`.
+* **REVIEW\_WORK** contient l’index de progression.
+  → un second appel **reprend** sans recréer.
+* Côté Salesforce, **Outbox** avec clé de déduplication stable :
+  `externalId = partyId + "-" + blockKind` (même agrégat).
+
+---
+
+## Quand même utiliser un peu d’asynchrone ?
+
+* **Uniquement** pour **Salesforce** (sortie) via Outbox + worker.
+* **Optionnel** : si la **famille** est très lente à récupérer, tu peux **déporter** la *récupération des pages suivantes* dans un **planificateur interne** (mais on reste dans le même module, sans events métier).
+
+---
+
+## Petits croquis (pour aligner)
+
+### Séquence (synchrone, sans événements internes)
+
+```plantuml
+@startuml
+actor iHub
+participant "HitService" as HIT
+participant "ReviewManager" as REV
+participant "FamilyClient" as FAM
+participant "BlockManager" as BLK
+database "DB" as DB
+queue "Outbox→SF" as OUT
+
+iHub -> HIT: process(startReviewCmd)
+HIT -> REV: openOrGet(party)
+REV --> HIT: reviewId
+loop pages
+  HIT -> FAM: fetch(page,size)
+  FAM --> HIT: members[]
+  HIT -> BLK: createOrReuseApprovedCurrent(reviewId, members)
+  BLK -> DB: batch SCD2 + attach review
+  BLK --> HIT: upsertMessages[]
+  HIT -> OUT: enqueue(upsertMessages)  ' asynchrone uniquement ici
+end
+HIT --> iHub: 200 OK (workId)
+@enduml
+```
+
+---
+
+## Avantages / inconvénients
+
+**+** Très **sobre** en runtime (pas d’events internes en rafale).
+**+** **Reprise** simple via `REVIEW_WORK`.
+**+** Transactions **courtes**, pas de “long-running TX”.
+**−** Le thread HTTP peut **tenir longtemps** si on ne borne pas la durée → prévoir **timeout + reprise** (202 + workId).
+**−** Un seul nœud traite le hit (c’est bien pour l’ordre par client ; si tu veux du cluster, garde un **verrou logique par party**).
+
+---
+
+## Ce que ça change pour tes estimations
+
+* On **retire** la partie “publication d’événements internes” des lots Hit/Review/Blocks.
+* On **ajoute** la gestion `REVIEW_WORK` + **chunking** + **reprise** (faible coût, \~2–3 jours).
+* L’effort total **reste comparable**, mais tu gagnes en **simplicité d’exploitation** et en **prévisibilité**.
+
+---
+
+Si tu veux, je te fournis :
+
+* un **DDL complet** pour `REVIEW_WORK` et les **index** utiles,
+* un **squelette Spring** (services, transactions par chunk, batch JDBC, outbox),
+* et une **spécification API** courte (POST hit, GET statut de travail, POST reprise).
