@@ -1,0 +1,316 @@
+C'est un choix très solide. Le passage à une **Saga Orchestrée** avec des boucles événementielles (Event-Loops) pour la synchronisation est l'architecture la plus robuste pour ton contexte Java 17 / Kubernetes.
+
+Voici le **Blueprint Technique Complet** (en anglais, comme demandé) formaté en Markdown. Tu peux copier ce bloc, le coller dans un fichier `ARCHITECTURE_BLUEPRINT.md` et le présenter à ton équipe.
+
+C'est un document de niveau "Lead Architect" qui couvre le *Pourquoi*, le *Comment*, le *Code* et le *Planning*.
+
+-----
+
+````markdown
+# Technical Blueprint: Asynchronous Review Orchestration & Salesforce Sync
+**Project:** Review Data Generation & External Synchronization  
+**Target Architecture:** Event-Driven Saga Orchestration (Spring Modulith)  
+**Stack:** Java 17, Spring Boot 3.4, Oracle, Kubernetes  
+
+---
+
+## 1. Executive Summary
+
+The objective of this architecture is to handle the high-volume generation of Review data (400 members, 2000+ blocks) and reliably synchronize this data to Salesforce under strict API limits (200 items/batch).
+
+We are moving away from a purely choreography-based approach (Point-to-Point) to an **Orchestration Saga Pattern**. This ensures central visibility of the process, transactional integrity, and resilience against container restarts (Kubernetes).
+
+### Key Architectural Decisions (ADR)
+1.  **Saga Orchestration:** A central `ReviewSaga` entity manages the state lifecycle. It commands modules to execute tasks but does not perform the heavy lifting itself.
+2.  **Worker Pattern (Micro-Concurrency):** Heavy data generation (Blocks) is delegated to async workers using a bounded `ThreadPoolTaskExecutor` to respect Java 17 container limits.
+3.  **Event-Driven Loop (Salesforce Sync):** Instead of a long-running loop, synchronization is broken down into discrete transactional steps (Batch Command -> Batch Event -> Update Cursor -> Next Command).
+
+---
+
+## 2. The Saga Pattern: Definition & Benefits
+
+**Definition:**
+The Saga pattern is a sequence of local transactions. Each local transaction updates the database and publishes a message or event to trigger the next local transaction in the saga. In our **Orchestration** variant, a central Coordinator (The Orchestrator) tells the participants what to do.
+
+**Why this pattern for us?**
+* **Observability:** We can query one table (`REVIEW_SAGA`) to see exactly where a Review is stuck (e.g., "Syncing Blocks, Batch 5/10").
+* **Resilience (State Recovery):** If a Pod crashes during the Salesforce sync (e.g., at batch 500), the Saga persists the "Cursor". On restart, it resumes at batch 500, avoiding duplicates.
+* **Transaction Management:** Eliminates "Long Transactions" that lock database rows for minutes. Each step is a sub-second transaction.
+
+---
+
+## 3. Architecture Diagrams
+
+### 3.1. High-Level State Machine
+This represents the lifecycle managed by the Saga Orchestrator.
+
+```mermaid
+stateDiagram-v2
+    [*] --> STARTED
+    STARTED --> MEMBERS_PENDING : Command(CreateMembers)
+    
+    state "Parallel Generation Phase" as Gen {
+        MEMBERS_PENDING --> BLOCKS_PENDING : Event(MembersDone)
+        BLOCKS_PENDING --> SYNC_READY : Event(BlocksDone)
+    }
+
+    state "Sequential Sync Loop (Re-entrant)" as Sync {
+        SYNC_READY --> SYNCING_MEMBERS
+        SYNCING_MEMBERS --> SYNCING_BLOCKS : Members Cursor >= Total
+        SYNCING_BLOCKS --> COMPLETED : Blocks Cursor >= Total
+        
+        SYNCING_MEMBERS --> SYNCING_MEMBERS : Batch Ack (Offset + 200)
+        SYNCING_BLOCKS --> SYNCING_BLOCKS : Batch Ack (Offset + 200)
+    }
+
+    COMPLETED --> [*]
+    
+    note right of Gen : Handled by Async Workers\n(Java 17 Thread Pool)
+    note right of Sync : Handled by Event Loop\n(No Long Transactions)
+````
+
+### 3.2. Sequence Diagram: Salesforce Sync Loop
+
+Detailing the "Event-Loop" mechanism to avoid long transactions.
+
+```mermaid
+sequenceDiagram
+    participant O as Orchestrator
+    participant SF as SalesforceWorker
+    participant DB as Database
+
+    Note over O, SF: Phase: Synchronizing Blocks (Total: 2000)
+    
+    O->>DB: Load Saga (Cursor: 0)
+    O->>SF: Command: SyncBlocks(offset=0, limit=200)
+    activate SF
+    SF->>SF: Fetch Data & Call SF API
+    SF-->>O: Event: BatchSynced(count=200)
+    deactivate SF
+    
+    activate O
+    O->>DB: Update Saga (Cursor: 200)
+    O->>O: Check: Cursor < Total?
+    O->>SF: Command: SyncBlocks(offset=200, limit=200)
+    deactivate O
+
+    Note over O, SF: ... Repeating Loop ...
+    
+    O->>DB: Update Saga (Cursor: 2000)
+    O->>O: Check: Cursor == Total
+    O->>DB: Set Status COMPLETED
+```
+
+-----
+
+## 4\. Detailed Implementation & Code Samples
+
+### 4.1. The Saga Entity (The "Brain")
+
+Centralizes state and cursors. Uses Optimistic Locking.
+
+```java
+@Entity
+@Table(name = "REVIEW_SAGA")
+public class ReviewSaga {
+    @Id
+    private String reviewId;
+
+    @Enumerated(EnumType.STRING)
+    private SagaStatus status; // STARTED, MEMBERS_PENDING, BLOCKS_PENDING, SYNCING, COMPLETED
+
+    // --- State Context ---
+    private int totalMembers;
+    private int totalBlocks;
+
+    // --- Checkpoints (Cursors) ---
+    private int sfMemberOffset = 0;
+    private int sfBlockOffset = 0;
+
+    @Version // Crucial for concurrency control
+    private Long version;
+    
+    // Helper to check if sync is fully done
+    public boolean isSyncComplete() {
+        return sfMemberOffset >= totalMembers && sfBlockOffset >= totalBlocks;
+    }
+}
+```
+
+### 4.2. Step 1: Parallel Block Generation (The "Muscle")
+
+Uses a bounded Thread Pool to handle high volume without crashing the container.
+
+**Configuration:**
+
+```java
+@Configuration
+@EnableAsync
+public class AsyncConfig {
+    @Bean(name = "workerExecutor")
+    public Executor workerExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(20); // Limit concurrency
+        executor.setMaxPoolSize(40);
+        executor.setQueueCapacity(2000);
+        executor.setThreadNamePrefix("SagaWorker-");
+        executor.initialize();
+        return executor;
+    }
+}
+```
+
+**Worker Logic (Idempotent):**
+
+```java
+@Service
+public class BlockWorker {
+
+    @Async("workerExecutor")
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void generateBlocksForMember(String reviewId, String memberId) {
+        // 1. Idempotency Check (Restart safety)
+        if (blockRepository.existsByReviewAndMember(reviewId, memberId)) {
+            return; 
+        }
+
+        // 2. Heavy Lifting (API Call + Logic)
+        var data = externalApi.fetch(memberId);
+        var blocks = createBlocks(data);
+        blockRepository.saveAll(blocks);
+
+        // 3. Notify Completion (To trigger Saga progress check)
+        events.publishEvent(new MemberProcessingFinishedEvent(reviewId));
+    }
+}
+```
+
+### 4.3. Step 2: The Orchestrator (The "Conductor")
+
+Manages transitions.
+
+```java
+@Component
+@RequiredArgsConstructor
+public class SagaOrchestrator {
+
+    private final SagaRepository repository;
+    private final ApplicationEventPublisher events;
+
+    // --- Phase 1: Start ---
+    @ApplicationModuleListener
+    @Transactional
+    public void on(ReviewCreatedEvent event) {
+        var saga = new ReviewSaga(event.reviewId());
+        saga.setStatus(SagaStatus.MEMBERS_PENDING);
+        repository.save(saga);
+        // Command to Member Module
+        events.publishEvent(new GenerateMembersCommand(event.reviewId())); 
+    }
+
+    // --- Phase 2: Transition to Sync ---
+    @ApplicationModuleListener
+    @Transactional
+    public void on(AllBlocksGeneratedEvent event) {
+        var saga = repository.findById(event.reviewId()).orElseThrow();
+        saga.setTotalBlocks(event.totalCount());
+        saga.setStatus(SagaStatus.SYNCING);
+        repository.save(saga);
+        
+        // Trigger the Loop
+        triggerNextSyncBatch(saga);
+    }
+
+    // --- Phase 3: The Sync Loop ---
+    @ApplicationModuleListener
+    @Transactional
+    public void on(SalesforceBatchCompletedEvent event) {
+        var saga = repository.findById(event.reviewId()).orElseThrow();
+        
+        // Update Cursor based on what was just synced
+        if (event.type() == DataType.MEMBER) {
+            saga.setSfMemberOffset(saga.getSfMemberOffset() + event.count());
+        } else {
+            saga.setSfBlockOffset(saga.getSfBlockOffset() + event.count());
+        }
+        
+        if (saga.isSyncComplete()) {
+            finalizeSaga(saga);
+        } else {
+            // Re-entrant: Continue the loop in a NEW transaction
+            triggerNextSyncBatch(saga);
+        }
+        repository.save(saga);
+    }
+
+    private void triggerNextSyncBatch(ReviewSaga saga) {
+        // Priority: Members first, then Blocks
+        if (saga.getSfMemberOffset() < saga.getTotalMembers()) {
+            events.publishEvent(new SyncBatchCommand(
+                saga.getReviewId(), DataType.MEMBER, saga.getSfMemberOffset(), 200));
+        } else {
+            events.publishEvent(new SyncBatchCommand(
+                saga.getReviewId(), DataType.BLOCK, saga.getSfBlockOffset(), 200));
+        }
+    }
+}
+```
+
+-----
+
+## 5\. Implementation Roadmap (User Stories)
+
+To deliver this safely, we will split the implementation into 5 distinctive User Stories.
+
+### Story 1: Saga Infrastructure & State Machine
+
+  * **Goal:** Establish the `ReviewSaga` entity and the Orchestrator skeleton.
+  * **Tasks:**
+      * Create `ReviewSaga` Entity (JPA).
+      * Create `SagaOrchestrator` Service.
+      * Implement state transitions for `ReviewCreated` event.
+  * **Acceptance Criteria:** A Review creation initializes a Saga row in DB with status `STARTED`.
+
+### Story 2: Async Member Generation
+
+  * **Goal:** Decouple Member creation using the Worker pattern.
+  * **Tasks:**
+      * Configure `ThreadPoolTaskExecutor`.
+      * Implement `@Async` listener for `GenerateMembersCommand`.
+      * Implement "Pessimistic Lock" tracker for completion detection.
+  * **Acceptance Criteria:** 400 Members are created in parallel without blocking the main thread.
+
+### Story 3: High-Volume Block Generation
+
+  * **Goal:** Handle the 2000+ blocks generation efficiently.
+  * **Tasks:**
+      * Replicate Async Worker pattern for Blocks.
+      * Implement Idempotency check (`existsBy...`) to handle retries.
+      * Emit `AllBlocksGeneratedEvent` when the counter hits the target.
+  * **Acceptance Criteria:** Blocks are generated. System handles duplicate events gracefully.
+
+### Story 4: Salesforce Sync Loop (The Engine)
+
+  * **Goal:** Implement the "Event-Loop" for Salesforce.
+  * **Tasks:**
+      * Implement `SyncBatchCommand` listener in Salesforce Module.
+      * Implement the Logic in Orchestrator to calculate Offsets.
+      * Implement the "Re-entrant" loop (Event -\> Command -\> Event).
+  * **Acceptance Criteria:** Data is pushed to Salesforce in batches of 200. If the app restarts, sync resumes from the last batch.
+
+### Story 5: Finalization & Resilience
+
+  * **Goal:** Handle final status and edge cases.
+  * **Tasks:**
+      * Implement `finalizeSaga` (Update Review Status to IN\_PROGRESS).
+      * Add Error States (`SYNC_FAILED`) and Retry mechanism (Scheduler).
+  * **Acceptance Criteria:** Review status updates only when Salesforce is fully synced.
+
+-----
+
+## 6\. Conclusion
+
+This architecture allows the application to handle high throughput (Parallel Workers) while maintaining strict consistency and respecting external API limits (Saga Orchestrator + Cursors). It is specifically designed to be robust in a containerized Java 17 environment.
+
+```
+```
