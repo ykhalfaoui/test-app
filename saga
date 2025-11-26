@@ -1,0 +1,958 @@
+# Deep Dive : Solutions Techniques
+
+Je reprends chaque point avec une solution concrète, testable, et prête à implémenter.
+
+---
+
+## 1. Race Condition sur le Completion Check
+
+### Le Problème Illustré
+
+```
+Timeline:
+Worker-399 finit → countByStatus(PROCESSING) = 1 → return
+Worker-400 finit → countByStatus(PROCESSING) = 0 → trigger sync ✓
+
+Mais en réalité avec concurrence:
+Worker-399 finit → countByStatus(PROCESSING) = 1
+Worker-400 finit → countByStatus(PROCESSING) = 0  (avant que 399 ait return)
+                → DEUX threads passent le check simultanément
+```
+
+### Solution A : Compteur Atomique en DB
+
+L'idée : au lieu de compter les rows, on maintient un compteur atomique qu'on décrémente.
+
+```java
+@Entity
+@Table(name = "REVIEW_SAGA")
+public class ReviewSaga {
+    // ... existing fields
+    
+    private int pendingWorkersCount; // Initialisé à 400
+    
+    @Version
+    private Long version; // Optimistic locking
+}
+```
+
+```java
+@Repository
+public interface SagaRepository extends JpaRepository<ReviewSaga, String> {
+    
+    /**
+     * Décrémente atomiquement et retourne le nouveau count.
+     * Une seule query = atomique au niveau DB.
+     */
+    @Modifying
+    @Query("""
+        UPDATE ReviewSaga s 
+        SET s.pendingWorkersCount = s.pendingWorkersCount - 1 
+        WHERE s.reviewId = :reviewId
+        """)
+    void decrementPendingCount(@Param("reviewId") String reviewId);
+    
+    @Query("SELECT s.pendingWorkersCount FROM ReviewSaga s WHERE s.reviewId = :reviewId")
+    int getPendingCount(@Param("reviewId") String reviewId);
+}
+```
+
+```java
+@Component
+public class SagaManager {
+
+    @Transactional
+    public void onWorkerFinished(String reviewId) {
+        // Décrémente ET récupère en une transaction
+        sagaRepo.decrementPendingCount(reviewId);
+        int remaining = sagaRepo.getPendingCount(reviewId);
+        
+        if (remaining > 0) {
+            return; // D'autres workers tournent encore
+        }
+        
+        // SEUL thread à atteindre ce point
+        processCompletion(reviewId);
+    }
+}
+```
+
+**Problème** : deux queries séparées = toujours une race condition possible.
+
+### Solution B : Décrement + Check Atomique (Recommandée)
+
+```java
+@Repository
+public interface SagaRepository extends JpaRepository<ReviewSaga, String> {
+    
+    /**
+     * Décrémente et retourne le nouveau count en UNE SEULE opération.
+     * Utilise une fonction native Oracle pour garantir l'atomicité.
+     */
+    @Modifying
+    @Query(value = """
+        UPDATE REVIEW_SAGA 
+        SET PENDING_WORKERS_COUNT = PENDING_WORKERS_COUNT - 1 
+        WHERE REVIEW_ID = :reviewId 
+        RETURNING PENDING_WORKERS_COUNT INTO :newCount
+        """, nativeQuery = true)
+    int decrementAndGetRemaining(@Param("reviewId") String reviewId);
+}
+```
+
+Mais JPA ne supporte pas bien `RETURNING`. Alternative plus propre :
+
+```java
+@Service
+@RequiredArgsConstructor
+public class AtomicSagaCounter {
+    
+    private final JdbcTemplate jdbc;
+    
+    /**
+     * Décrémente et retourne le nouveau count atomiquement.
+     * Thread-safe grâce à l'atomicité de l'UPDATE.
+     */
+    public int decrementAndGet(String reviewId) {
+        return jdbc.queryForObject("""
+            UPDATE REVIEW_SAGA 
+            SET PENDING_WORKERS_COUNT = PENDING_WORKERS_COUNT - 1 
+            WHERE REVIEW_ID = ? 
+            RETURNING PENDING_WORKERS_COUNT
+            """, 
+            Integer.class, 
+            reviewId
+        );
+    }
+}
+```
+
+```java
+@Component
+public class SagaManager {
+
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void onWorkerFinished(MemberProcessingAttemptFinished event) {
+        int remaining = atomicCounter.decrementAndGet(event.reviewId());
+        
+        if (remaining == 0) {
+            // Garanti : UN SEUL thread passe ici
+            processCompletion(event.reviewId());
+        }
+    }
+}
+```
+
+### Solution C : Lock Pessimiste (Plus simple, moins performant)
+
+```java
+@Repository
+public interface SagaRepository extends JpaRepository<ReviewSaga, String> {
+    
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT s FROM ReviewSaga s WHERE s.reviewId = :reviewId")
+    Optional<ReviewSaga> findByIdForUpdate(@Param("reviewId") String reviewId);
+}
+```
+
+```java
+@Transactional
+public void onWorkerFinished(MemberProcessingAttemptFinished event) {
+    // Lock exclusif sur la row Saga
+    var saga = sagaRepo.findByIdForUpdate(event.reviewId())
+        .orElseThrow();
+    
+    long processingCount = statusRepo.countByReviewIdAndStatus(
+        event.reviewId(), 
+        ProcessStatus.PROCESSING
+    );
+    
+    if (processingCount > 0) {
+        return;
+    }
+    
+    // Safe: on a le lock
+    processCompletion(saga);
+}
+```
+
+**Trade-off** : sérialise tous les workers sur le lock. Avec 400 workers, ça peut créer de la contention. Mais c'est simple et correct.
+
+### Comparatif
+
+| Solution | Complexité | Performance | Correctness |
+|----------|------------|-------------|-------------|
+| Compteur atomique (B) | Moyenne | Excellente | ✓ |
+| Lock pessimiste (C) | Faible | Moyenne | ✓ |
+| Count sans lock (Original) | Faible | Excellente | ✗ Race condition |
+
+**Ma recommandation** : Solution B si Oracle supporte `RETURNING`, sinon Solution C.
+
+---
+
+## 2. Fenêtre de Perte d'Event : Transactional Outbox
+
+### Le Problème
+
+```java
+@Transactional
+public void process(String reviewId, String memberId) {
+    status.setStatus(ProcessStatus.SUCCESS);
+    statusRepo.save(status);
+    // COMMIT HAPPENS HERE
+    
+    // ⚠️ Container crash ici = event perdu à jamais
+    events.publishEvent(new MemberProcessingAttemptFinished(reviewId));
+}
+```
+
+### Solution : Outbox Pattern
+
+L'event est persisté DANS la même transaction que le changement d'état. Un poller séparé lit l'outbox et publie les events.
+
+#### Step 1 : Outbox Entity
+
+```java
+@Entity
+@Table(name = "EVENT_OUTBOX")
+public class OutboxEvent {
+    
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private String id;
+    
+    @Column(nullable = false)
+    private String aggregateType; // "MemberProcessStatus"
+    
+    @Column(nullable = false)
+    private String aggregateId;   // reviewId
+    
+    @Column(nullable = false)
+    private String eventType;     // "MemberProcessingAttemptFinished"
+    
+    @Column(columnDefinition = "CLOB")
+    private String payload;       // JSON
+    
+    @Column(nullable = false)
+    private Instant createdAt;
+    
+    @Column(nullable = false)
+    private OutboxStatus status;  // PENDING, PUBLISHED, FAILED
+    
+    private Instant publishedAt;
+}
+
+public enum OutboxStatus {
+    PENDING, PUBLISHED, FAILED
+}
+```
+
+#### Step 2 : Écriture dans l'Outbox (même transaction)
+
+```java
+@Service
+@RequiredArgsConstructor
+public class BlockAsyncWorker {
+
+    private final OutboxRepository outboxRepo;
+    private final ObjectMapper objectMapper;
+
+    @Async("workerExecutor")
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void process(String reviewId, String memberId) {
+        var status = statusRepo.findByKey(reviewId, memberId);
+        
+        try {
+            status.setStatus(ProcessStatus.PROCESSING);
+            statusRepo.save(status);
+
+            var data = externalClient.fetch(memberId);
+            blockService.createBlocks(data, reviewId);
+
+            status.setStatus(ProcessStatus.SUCCESS);
+            
+        } catch (Exception e) {
+            status.setStatus(ProcessStatus.ERROR);
+            status.setErrorMessage(truncate(e.getMessage(), 500));
+        }
+        
+        statusRepo.save(status);
+        
+        // Écriture Outbox dans la MÊME transaction
+        var event = new MemberProcessingAttemptFinished(reviewId, memberId, status.getStatus());
+        outboxRepo.save(OutboxEvent.builder()
+            .aggregateType("MemberProcessStatus")
+            .aggregateId(reviewId)
+            .eventType(event.getClass().getSimpleName())
+            .payload(objectMapper.writeValueAsString(event))
+            .status(OutboxStatus.PENDING)
+            .createdAt(Instant.now())
+            .build()
+        );
+        
+        // COMMIT : status ET outbox event sont persistés ensemble
+    }
+}
+```
+
+#### Step 3 : Outbox Poller
+
+```java
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class OutboxPoller {
+
+    private final OutboxRepository outboxRepo;
+    private final ApplicationEventPublisher eventPublisher;
+    private final ObjectMapper objectMapper;
+    
+    // Map eventType -> Class pour désérialisation
+    private static final Map<String, Class<?>> EVENT_TYPES = Map.of(
+        "MemberProcessingAttemptFinished", MemberProcessingAttemptFinished.class
+    );
+
+    @Scheduled(fixedDelay = 100) // Poll toutes les 100ms
+    @Transactional
+    public void pollAndPublish() {
+        // Récupère un batch d'events pending avec lock
+        var events = outboxRepo.findPendingWithLock(50);
+        
+        for (var outbox : events) {
+            try {
+                Class<?> eventClass = EVENT_TYPES.get(outbox.getEventType());
+                Object event = objectMapper.readValue(outbox.getPayload(), eventClass);
+                
+                eventPublisher.publishEvent(event);
+                
+                outbox.setStatus(OutboxStatus.PUBLISHED);
+                outbox.setPublishedAt(Instant.now());
+                
+            } catch (Exception e) {
+                log.error("Failed to publish event {}", outbox.getId(), e);
+                outbox.setStatus(OutboxStatus.FAILED);
+            }
+            outboxRepo.save(outbox);
+        }
+    }
+}
+```
+
+```java
+@Repository
+public interface OutboxRepository extends JpaRepository<OutboxEvent, String> {
+    
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("""
+        SELECT e FROM OutboxEvent e 
+        WHERE e.status = 'PENDING' 
+        ORDER BY e.createdAt ASC
+        """)
+    List<OutboxEvent> findPendingWithLock(Pageable pageable);
+    
+    default List<OutboxEvent> findPendingWithLock(int limit) {
+        return findPendingWithLock(PageRequest.of(0, limit));
+    }
+}
+```
+
+#### Step 4 : Cleanup Job
+
+```java
+@Scheduled(cron = "0 0 2 * * *") // Tous les jours à 2h
+@Transactional
+public void cleanupOldEvents() {
+    var threshold = Instant.now().minus(Duration.ofDays(7));
+    outboxRepo.deleteByStatusAndPublishedAtBefore(OutboxStatus.PUBLISHED, threshold);
+}
+```
+
+### Garanties
+
+| Scénario | Comportement |
+|----------|--------------|
+| Crash après commit | Event est dans Outbox → Poller le publie au restart |
+| Crash avant commit | Transaction rollback → Rien n'est persisté → Cohérent |
+| Double publish | Possible si crash après publish mais avant update status → Le listener doit être **idempotent** |
+
+---
+
+## 3. Recovery des PROCESSING "Stuck"
+
+### Le Problème
+
+Un worker commence, met le status à `PROCESSING`, puis le pod crash. Le row reste `PROCESSING` indéfiniment.
+
+### Solution : Heartbeat + Recovery
+
+#### Option A : Timeout-based (Simple)
+
+```java
+@Entity
+@Table(name = "MEMBER_PROCESS_STATUS")
+public class MemberProcessStatus {
+    // ... existing fields
+    
+    private Instant processingStartedAt; // Nouveau champ
+}
+```
+
+```java
+// Dans le worker, au début du processing
+status.setStatus(ProcessStatus.PROCESSING);
+status.setProcessingStartedAt(Instant.now());
+statusRepo.save(status);
+```
+
+```java
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class StuckProcessingRecovery {
+
+    private static final Duration STUCK_THRESHOLD = Duration.ofMinutes(10);
+    private static final int MAX_INDIVIDUAL_RETRIES = 3;
+
+    @Scheduled(fixedRate = 60_000) // Toutes les minutes
+    @Transactional
+    public void recoverStuckProcessing() {
+        var threshold = Instant.now().minus(STUCK_THRESHOLD);
+        
+        var stuckRows = statusRepo.findStuckProcessing(threshold);
+        
+        if (stuckRows.isEmpty()) {
+            return;
+        }
+        
+        log.warn("Found {} stuck PROCESSING rows", stuckRows.size());
+        
+        // Group by reviewId pour re-dispatcher en batch
+        Map<String, List<MemberProcessStatus>> byReview = stuckRows.stream()
+            .collect(Collectors.groupingBy(MemberProcessStatus::getReviewId));
+        
+        for (var entry : byReview.entrySet()) {
+            String reviewId = entry.getKey();
+            List<MemberProcessStatus> stuck = entry.getValue();
+            
+            for (var status : stuck) {
+                if (status.getRetryCount() >= MAX_INDIVIDUAL_RETRIES) {
+                    // Trop de retries → marquer en erreur définitive
+                    status.setStatus(ProcessStatus.ERROR);
+                    status.setErrorMessage("Max retries exceeded (stuck recovery)");
+                    log.error("Member {} exceeded max retries", status.getMemberId());
+                } else {
+                    // Reset pour retry
+                    status.setStatus(ProcessStatus.TO_DO);
+                    status.setRetryCount(status.getRetryCount() + 1);
+                    status.setProcessingStartedAt(null);
+                }
+                statusRepo.save(status);
+            }
+            
+            // Re-trigger le dispatch pour ce review
+            blockOrchestrator.dispatchPending(reviewId);
+        }
+    }
+}
+```
+
+```java
+@Repository
+public interface ProcessStatusRepository extends JpaRepository<MemberProcessStatus, String> {
+    
+    @Query("""
+        SELECT s FROM MemberProcessStatus s 
+        WHERE s.status = 'PROCESSING' 
+        AND s.processingStartedAt < :threshold
+        """)
+    List<MemberProcessStatus> findStuckProcessing(@Param("threshold") Instant threshold);
+}
+```
+
+#### Option B : Heartbeat (Pour processing très long)
+
+Si certains processing peuvent légitimement durer plus de 10 minutes :
+
+```java
+@Entity
+@Table(name = "MEMBER_PROCESS_STATUS")
+public class MemberProcessStatus {
+    // ... existing fields
+    
+    private Instant lastHeartbeat;
+}
+```
+
+```java
+@Service
+public class BlockAsyncWorker {
+
+    @Async("workerExecutor")
+    public void process(String reviewId, String memberId) {
+        var status = statusRepo.findByKey(reviewId, memberId);
+        
+        // Start heartbeat thread
+        var heartbeatTask = scheduler.scheduleAtFixedRate(
+            () -> updateHeartbeat(reviewId, memberId),
+            0, 30, TimeUnit.SECONDS
+        );
+        
+        try {
+            // ... processing logic
+        } finally {
+            heartbeatTask.cancel(false);
+        }
+    }
+    
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void updateHeartbeat(String reviewId, String memberId) {
+        statusRepo.updateHeartbeat(reviewId, memberId, Instant.now());
+    }
+}
+```
+
+Le recovery check `lastHeartbeat` au lieu de `processingStartedAt`.
+
+**Ma recommandation** : Option A (timeout simple) suffit pour ton use case. 10 minutes est généreux pour un call API + création de blocks.
+
+---
+
+## 4. Idempotence du Dispatch
+
+### Le Problème
+
+```java
+public void dispatchPending(String reviewId) {
+    var pending = statusRepo.findPending(reviewId);
+    pending.forEach(p -> asyncWorker.process(reviewId, p.getMemberId()));
+}
+```
+
+Si appelé deux fois rapidement → le même member est dispatché deux fois → processing dupliqué.
+
+### Solution : Claim Pattern
+
+```java
+@Repository
+public interface ProcessStatusRepository extends JpaRepository<MemberProcessStatus, String> {
+    
+    /**
+     * Tente de "claim" un member pour processing.
+     * Retourne 1 si claim réussi, 0 si déjà pris.
+     */
+    @Modifying
+    @Query("""
+        UPDATE MemberProcessStatus s 
+        SET s.status = 'PROCESSING', s.processingStartedAt = :now 
+        WHERE s.reviewId = :reviewId 
+        AND s.memberId = :memberId 
+        AND s.status IN ('TO_DO', 'ERROR')
+        """)
+    int claimForProcessing(
+        @Param("reviewId") String reviewId,
+        @Param("memberId") String memberId,
+        @Param("now") Instant now
+    );
+}
+```
+
+```java
+@Service
+public class BlockAsyncWorker {
+
+    @Async("workerExecutor")
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void process(String reviewId, String memberId) {
+        
+        // Tente de claim - si déjà PROCESSING, on skip
+        int claimed = statusRepo.claimForProcessing(reviewId, memberId, Instant.now());
+        
+        if (claimed == 0) {
+            log.debug("Member {} already being processed, skipping", memberId);
+            return; // Pas d'event publié - le "vrai" worker le fera
+        }
+        
+        var status = statusRepo.findByKey(reviewId, memberId);
+        
+        try {
+            var data = externalClient.fetch(memberId);
+            blockService.createBlocks(data, reviewId);
+            status.setStatus(ProcessStatus.SUCCESS);
+            
+        } catch (Exception e) {
+            status.setStatus(ProcessStatus.ERROR);
+            status.setErrorMessage(e.getMessage());
+        }
+        
+        statusRepo.save(status);
+        
+        // Outbox event...
+    }
+}
+```
+
+### Garantie
+
+| Scénario | Comportement |
+|----------|--------------|
+| Double dispatch simultané | Premier thread claim → UPDATE returns 1. Second thread → UPDATE returns 0 → skip |
+| Retry après ERROR | status = ERROR → claim réussit → re-processing |
+| Recovery après stuck | status reset TO_DO → claim réussit |
+
+---
+
+## 5. Salesforce Partial Batch Failure
+
+### Le Problème
+
+Tu envoies 200 items, SF en accepte 150, en rejette 50. Comment tu gères ?
+
+### Solution : Granular SF Status Tracking
+
+```java
+@Entity
+@Table(name = "SF_SYNC_STATUS")
+public class SalesforceSyncStatus {
+    
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private String id;
+    
+    private String reviewId;
+    private String entityType;    // "MEMBER" ou "BLOCK"
+    private String entityId;      // memberId ou blockId
+    
+    @Enumerated(EnumType.STRING)
+    private SyncStatus status;    // PENDING, SUCCESS, FAILED, SKIPPED
+    
+    private String salesforceId;  // ID retourné par SF si succès
+    private String errorMessage;
+    private int retryCount;
+}
+
+public enum SyncStatus {
+    PENDING, SUCCESS, FAILED, SKIPPED
+}
+```
+
+```java
+@Service
+@RequiredArgsConstructor
+public class SalesforceSync {
+
+    private static final int BATCH_SIZE = 200;
+    private static final int MAX_SYNC_RETRIES = 3;
+
+    @Transactional
+    public SyncBatchResult syncMemberBatch(String reviewId, int offset) {
+        
+        // 1. Récupère les membres SUCCESS, pas encore sync (ou FAILED avec retry < max)
+        var toSync = syncStatusRepo.findPendingMembers(reviewId, BATCH_SIZE);
+        
+        if (toSync.isEmpty()) {
+            return SyncBatchResult.empty();
+        }
+        
+        // 2. Appel SF
+        var sfRequest = toSync.stream()
+            .map(this::mapToSalesforcePayload)
+            .toList();
+        
+        SalesforceResponse response = salesforceClient.upsertBatch(sfRequest);
+        
+        // 3. Process résultats individuels
+        int successCount = 0;
+        int failedCount = 0;
+        List<String> failedIds = new ArrayList<>();
+        
+        for (int i = 0; i < response.getResults().size(); i++) {
+            var result = response.getResults().get(i);
+            var syncStatus = toSync.get(i);
+            
+            if (result.isSuccess()) {
+                syncStatus.setStatus(SyncStatus.SUCCESS);
+                syncStatus.setSalesforceId(result.getId());
+                successCount++;
+            } else {
+                syncStatus.setRetryCount(syncStatus.getRetryCount() + 1);
+                
+                if (syncStatus.getRetryCount() >= MAX_SYNC_RETRIES) {
+                    syncStatus.setStatus(SyncStatus.FAILED);
+                    syncStatus.setErrorMessage(result.getError());
+                } else {
+                    // Reste PENDING pour retry au prochain batch
+                    syncStatus.setErrorMessage(result.getError());
+                }
+                
+                failedCount++;
+                failedIds.add(syncStatus.getEntityId());
+            }
+            
+            syncStatusRepo.save(syncStatus);
+        }
+        
+        return new SyncBatchResult(successCount, failedCount, failedIds);
+    }
+}
+```
+
+```java
+public record SyncBatchResult(
+    int successCount,
+    int failedCount,
+    List<String> failedIds
+) {
+    public static SyncBatchResult empty() {
+        return new SyncBatchResult(0, 0, List.of());
+    }
+    
+    public boolean hasMoreToSync() {
+        return successCount > 0 || failedCount > 0;
+    }
+}
+```
+
+### Modification du Saga
+
+```java
+@ApplicationModuleListener
+@Transactional
+public void on(SyncBatchCompletedEvent event) {
+    var saga = sagaRepo.findByIdForUpdate(event.reviewId());
+    
+    // On ne compte plus les offsets, on check ce qui reste à sync
+    long pendingMembers = syncStatusRepo.countPending(event.reviewId(), "MEMBER");
+    long pendingBlocks = syncStatusRepo.countPending(event.reviewId(), "BLOCK");
+    
+    if (pendingMembers > 0) {
+        // Continue syncing members
+        commandGateway.dispatch(new SyncMembersCommand(saga.getReviewId()));
+    } else if (pendingBlocks > 0) {
+        // Move to blocks
+        commandGateway.dispatch(new SyncBlocksCommand(saga.getReviewId()));
+    } else {
+        // All done
+        long failedTotal = syncStatusRepo.countFailed(event.reviewId());
+        if (failedTotal > 0) {
+            log.warn("Review {} completed with {} sync failures", event.reviewId(), failedTotal);
+        }
+        saga.setStep(SagaStep.FINALIZING);
+    }
+    
+    sagaRepo.save(saga);
+}
+```
+
+---
+
+## 6. Alternative au Pattern "1 Event par Worker"
+
+### Solution : Batched Completion Check
+
+Au lieu de publier un event par worker, on utilise un polling régulier :
+
+```java
+@Component
+@RequiredArgsConstructor
+public class GenerationCompletionPoller {
+
+    @Scheduled(fixedDelay = 5000) // Check toutes les 5 secondes
+    @Transactional
+    public void checkCompletions() {
+        // Trouve les sagas en phase de génération
+        var sagas = sagaRepo.findByStep(SagaStep.GEN_DATA);
+        
+        for (var saga : sagas) {
+            long processing = statusRepo.countByReviewIdAndStatus(
+                saga.getReviewId(), 
+                ProcessStatus.PROCESSING
+            );
+            
+            if (processing == 0) {
+                // Tous les workers ont fini
+                processCompletion(saga);
+            }
+        }
+    }
+    
+    private void processCompletion(ReviewSaga saga) {
+        long errors = statusRepo.countByReviewIdAndStatus(
+            saga.getReviewId(), 
+            ProcessStatus.ERROR
+        );
+        
+        if (errors == 0) {
+            saga.setStep(SagaStep.SYNC_MEMBERS);
+            initSyncStatus(saga);
+            triggerSync(saga);
+        } else if (saga.getGenerationRetryCount() < MAX_RETRIES) {
+            saga.setGenerationRetryCount(saga.getGenerationRetryCount() + 1);
+            blockOrchestrator.dispatchPending(saga.getReviewId());
+        } else {
+            // Max retries - continue avec partial
+            saga.setStep(SagaStep.SYNC_MEMBERS);
+            initSyncStatus(saga); // N'init que les SUCCESS
+            triggerSync(saga);
+        }
+        
+        sagaRepo.save(saga);
+    }
+}
+```
+
+### Comparaison
+
+| Aspect | Event-Driven (Original) | Polling (Alternative) |
+|--------|-------------------------|----------------------|
+| Latence | ~0ms après dernier worker | 0-5 secondes |
+| Complexité | Outbox + Race condition handling | Simple scheduled job |
+| Charge DB | 400 events + 400 listeners | 1 query / 5 sec / saga active |
+| Scalabilité | Peut surcharger l'event bus | Scale linéairement |
+
+**Ma recommandation** : Pour un système batch comme le tien, le polling est plus simple et suffisant. La latence de 5 sec est négligeable sur un process total de plusieurs minutes.
+
+---
+
+## 7. Monitoring & Observabilité
+
+### Métriques Micrometer
+
+```java
+@Component
+@RequiredArgsConstructor
+public class SagaMetrics {
+
+    private final MeterRegistry registry;
+    
+    // Counters
+    private Counter membersProcessed;
+    private Counter membersErrored;
+    private Counter blocksCreated;
+    private Counter sfSyncSuccess;
+    private Counter sfSyncFailed;
+    
+    // Timers
+    private Timer memberProcessingTimer;
+    private Timer sfSyncTimer;
+    
+    // Gauges - registered dynamically
+    
+    @PostConstruct
+    void init() {
+        membersProcessed = Counter.builder("saga.members.processed")
+            .description("Total members processed successfully")
+            .register(registry);
+            
+        membersErrored = Counter.builder("saga.members.errored")
+            .description("Total members that failed processing")
+            .register(registry);
+            
+        blocksCreated = Counter.builder("saga.blocks.created")
+            .description("Total blocks created")
+            .register(registry);
+            
+        memberProcessingTimer = Timer.builder("saga.member.processing.duration")
+            .description("Time to process a single member")
+            .publishPercentiles(0.5, 0.95, 0.99)
+            .register(registry);
+            
+        // Gauge for active sagas
+        Gauge.builder("saga.active.count", sagaRepo, 
+            repo -> repo.countByStepNotIn(List.of(SagaStep.COMPLETED, SagaStep.FAILED)))
+            .register(registry);
+    }
+    
+    public Timer.Sample startMemberProcessing() {
+        return Timer.start(registry);
+    }
+    
+    public void recordMemberSuccess(Timer.Sample sample) {
+        sample.stop(memberProcessingTimer);
+        membersProcessed.increment();
+    }
+    
+    public void recordMemberError(Timer.Sample sample) {
+        sample.stop(memberProcessingTimer);
+        membersErrored.increment();
+    }
+}
+```
+
+### Usage dans le Worker
+
+```java
+@Service
+public class BlockAsyncWorker {
+
+    @Async("workerExecutor")
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void process(String reviewId, String memberId) {
+        var sample = sagaMetrics.startMemberProcessing();
+        
+        try {
+            // ... processing
+            sagaMetrics.recordMemberSuccess(sample);
+        } catch (Exception e) {
+            sagaMetrics.recordMemberError(sample);
+            throw e;
+        }
+    }
+}
+```
+
+### Tracing (Correlation ID)
+
+```java
+@Component
+public class BlockOrchestrator {
+
+    @ApplicationModuleListener
+    @Transactional
+    public void on(GenerateBlocksCommand command) {
+        // Set MDC pour tous les logs de ce review
+        MDC.put("reviewId", command.reviewId());
+        MDC.put("correlationId", UUID.randomUUID().toString());
+        
+        try {
+            // ... processing
+        } finally {
+            MDC.clear();
+        }
+    }
+}
+```
+
+```java
+// Dans le worker - propager le correlation ID
+@Async("workerExecutor")
+public void process(String reviewId, String memberId, String correlationId) {
+    MDC.put("reviewId", reviewId);
+    MDC.put("memberId", memberId);
+    MDC.put("correlationId", correlationId);
+    
+    try {
+        log.info("Starting member processing"); // Auto-tagged
+        // ...
+    } finally {
+        MDC.clear();
+    }
+}
+```
+
+---
+
+## Récapitulatif des Solutions
+
+| Problème | Solution Recommandée | Effort |
+|----------|---------------------|--------|
+| Race condition completion | Compteur atomique avec RETURNING ou Lock pessimiste | 2h |
+| Perte d'event | Transactional Outbox Pattern | 4h |
+| PROCESSING stuck | Scheduled recovery avec timeout 10min | 2h |
+| Double dispatch | Claim pattern (UPDATE WHERE status IN) | 1h |
+| SF partial failure | Granular SyncStatus table | 3h |
+| Event flood | Remplacer par polling 5sec | 2h (simplification) |
+| Monitoring | Micrometer counters/timers + MDC | 2h |
+
+**Total estimé : 2-3 jours** pour hardener le système avant go prod.
+
+Tu veux que je détaille les tests unitaires pour un de ces patterns ?
