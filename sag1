@@ -1,0 +1,352 @@
+Here is the final **Technical Architecture Blueprint**. It incorporates every pattern we discussed: **Saga Orchestration**, **Thin Events (API Pull)**, **Async Workers**, **Re-entrant Salesforce Loop**, and crucially, the **Granular Error Tracking & Retry Strategy**.
+
+You can copy this directly into your project documentation.
+
+-----
+
+# Technical Blueprint: High-Volume Review Orchestration & Sync System
+
+**Role:** Lead Solution Architect  
+**Stack:** Java 17, Spring Boot 3.4 (Modulith), Oracle, Kubernetes  
+**Version:** 2.0 (Final - With Retry Strategy)
+
+-----
+
+## 1\. Executive Summary
+
+This architecture is designed to handle the generation of high-volume compliance data (1 Review $\rightarrow$ 400 Members $\rightarrow$ 2000+ Blocks) and synchronize it with Salesforce.
+
+It addresses specific critical constraints:
+
+1.  **Event Registry Limits:** Payloads must remain small (\<4KB). We use the **"Thin Event + API Pull"** pattern.
+2.  **Container Stability:** High concurrency is managed via a **Bounded Thread Pool** (Java 17 safe).
+3.  **Resilience:** We implement **Granular State Tracking** to allow precise retries of failed items (Members/Blocks) without restarting the whole process.
+4.  **Salesforce Limits:** Synchronization uses a **Re-entrant Event Loop** to respect the 200-item batch limit.
+
+-----
+
+## 2\. Global Architecture Diagram
+
+```mermaid
+stateDiagram-v2
+    [*] --> DRAFT_SYNC
+    
+    state "Data Generation Phase" as Gen {
+        DRAFT_SYNC --> INIT_TRACKING : Header Synced
+        INIT_TRACKING --> PARALLEL_PROCESSING : Status Rows Created
+        PARALLEL_PROCESSING --> CHECK_COMPLETION : Workers Active
+        
+        state "Retry Logic" as Retry {
+            CHECK_COMPLETION --> RETRYING_ERRORS : Errors Found & Retry < Max
+            RETRYING_ERRORS --> PARALLEL_PROCESSING : Re-dispatch Failed IDs
+        }
+    }
+
+    state "Sync Phase" as Sync {
+        CHECK_COMPLETION --> SYNC_MEMBERS : All Success / Max Retry Reached
+        SYNC_MEMBERS --> SYNC_BLOCKS : Cursor >= Total
+        SYNC_BLOCKS --> FINALIZING : Cursor >= Total
+        
+        SYNC_MEMBERS --> SYNC_MEMBERS : Batch Loop (200)
+        SYNC_BLOCKS --> SYNC_BLOCKS : Batch Loop (200)
+    }
+
+    FINALIZING --> COMPLETED
+```
+
+-----
+
+## 3\. Core Data Models
+
+### 3.1. The Saga Entity (Macro State)
+
+Manages the overall lifecycle and Salesforce cursors.
+
+```java
+@Entity
+@Table(name = "REVIEW_SAGA")
+public class ReviewSaga {
+    @Id private String reviewId;
+    
+    @Enumerated(EnumType.STRING)
+    private SagaStep step; // HEADER, GEN_DATA, SYNC, FINALIZE, COMPLETED
+    
+    private String salesforceId;
+    
+    // Sync Cursors
+    private int sfMemberOffset = 0;
+    private int sfBlockOffset = 0;
+    
+    // Retry Management
+    private int generationRetryCount = 0;
+    private static final int MAX_RETRIES = 3;
+}
+```
+
+### 3.2. Granular Process Status (Micro State)
+
+**Crucial for Error Handling:** Tracks the status of *each* member independently.
+
+```java
+@Entity
+@Table(name = "MEMBER_PROCESS_STATUS")
+public class MemberProcessStatus {
+    @Id private String id;
+    
+    @Column(nullable = false) private String reviewId;
+    @Column(nullable = false) private String memberId;
+    
+    @Enumerated(EnumType.STRING)
+    private ProcessStatus status; // TO_DO, PROCESSING, SUCCESS, ERROR
+    
+    private String errorMessage;
+    private int retryCount; // Individual retry count
+}
+```
+
+-----
+
+## 4\. Detailed Implementation Phases
+
+### Phase 1: Block Generation (With "API Pull" & "Granular Tracking")
+
+**Context:** We need to create blocks for 400 members. Passing IDs in the event is forbidden (size limit).
+
+#### Step 1: Orchestrator (Pull & Init)
+
+The Orchestrator receives the command, fetches IDs via Internal API, and initializes the "Checklist" in DB.
+
+```java
+@Service
+@RequiredArgsConstructor
+public class BlockOrchestrator {
+
+    private final MemberModuleApi memberApi; // Internal API
+    private final ProcessStatusRepository statusRepo;
+    private final BlockAsyncWorker asyncWorker;
+
+    @ApplicationModuleListener
+    @Transactional
+    public void on(GenerateBlocksCommand command) {
+        String reviewId = command.reviewId();
+
+        // 1. PULL: Fetch all IDs via Interface (Bypass Event limit)
+        List<String> allMemberIds = memberApi.getAllMemberIds(reviewId);
+
+        // 2. INIT: Create "TO_DO" rows for traceability
+        // This ensures we know exactly what needs to be done.
+        statusRepo.initBatch(reviewId, allMemberIds, ProcessStatus.TO_DO);
+
+        // 3. DISPATCH: Send to workers
+        dispatchPending(reviewId);
+    }
+    
+    public void dispatchPending(String reviewId) {
+        // Fetch TO_DO or ERROR rows
+        var pending = statusRepo.findPending(reviewId);
+        pending.forEach(p -> asyncWorker.process(reviewId, p.getMemberId()));
+    }
+}
+```
+
+#### Step 2: Async Worker (The Execution)
+
+Processes one member. Updates status to SUCCESS or ERROR.
+
+```java
+@Service
+public class BlockAsyncWorker {
+
+    @Async("workerExecutor") // Custom Thread Pool (Size 50)
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void process(String reviewId, String memberId) {
+        var status = statusRepo.findByKey(reviewId, memberId);
+        
+        try {
+            // A. Update State -> PROCESSING
+            status.setStatus(ProcessStatus.PROCESSING);
+            statusRepo.save(status);
+
+            // B. Logic: Call Ext API & Create Blocks
+            var data = externalClient.fetch(memberId); // Retryable client
+            blockService.createBlocks(data, reviewId);
+
+            // C. Update State -> SUCCESS
+            status.setStatus(ProcessStatus.SUCCESS);
+            statusRepo.save(status);
+
+        } catch (Exception e) {
+            // D. Handle Error
+            status.setStatus(ProcessStatus.ERROR);
+            status.setErrorMessage(e.getMessage());
+            statusRepo.save(status);
+        } finally {
+            // E. Notify Saga to check if ALL threads are done
+            events.publishEvent(new MemberProcessingAttemptFinished(reviewId));
+        }
+    }
+}
+```
+
+### Phase 2: Saga Error Handling & Retry Logic
+
+**Context:** What happens when the Workers finish, but 5 members failed?
+
+```java
+@Component
+public class SagaManager {
+
+    @ApplicationModuleListener
+    @Transactional
+    public void on(MemberProcessingAttemptFinished event) {
+        // 1. Check if all workers are done (No rows in 'PROCESSING')
+        if (statusRepo.countByStatus(PROCESSING) > 0) return;
+
+        // 2. Check for Errors
+        long errorCount = statusRepo.countByStatus(ERROR);
+        var saga = sagaRepo.findById(event.reviewId());
+
+        if (errorCount == 0) {
+            // SUCCESS: Move to Salesforce Sync
+            saga.setStep(SagaStep.SYNC_MEMBERS);
+            triggerSync(saga);
+        } 
+        else if (saga.getGenerationRetryCount() < ReviewSaga.MAX_RETRIES) {
+            // RETRY STRATEGY: Re-dispatch only failed items
+            saga.setGenerationRetryCount(saga.getGenerationRetryCount() + 1);
+            sagaRepo.save(saga);
+            
+            // Re-trigger Orchestrator to pick up ERROR rows
+            blockOrchestrator.dispatchPending(saga.getReviewId());
+        } 
+        else {
+            // FAILURE / PARTIAL SUCCESS STRATEGY
+            // Option A: Stop -> Human Intervention
+            // Option B: Continue -> Sync only successful items (Chosen here)
+            log.warn("Review {} proceeding with {} errors", saga.getReviewId(), errorCount);
+            saga.setStep(SagaStep.SYNC_MEMBERS);
+            triggerSync(saga);
+        }
+    }
+}
+```
+
+### Phase 3: Salesforce Sync (Re-entrant Loop)
+
+**Context:** Sync 2000 items in batches of 200. Resume on crash.
+
+```java
+@Component
+public class SalesforceSyncOrchestrator {
+
+    @ApplicationModuleListener
+    @Transactional
+    public void on(SyncBatchCompletedEvent event) {
+        var saga = sagaRepo.findById(event.reviewId());
+
+        // 1. Update Cursor
+        if (event.isMember()) saga.setSfMemberOffset(saga.getSfMemberOffset() + event.count());
+        else saga.setSfBlockOffset(saga.getSfBlockOffset() + event.count());
+
+        // 2. Loop Logic
+        if (saga.getSfMemberOffset() < saga.getTotalMembers()) {
+             // Sync Next 200 Members
+             commandGateway.dispatch(new SyncMembersCommand(saga.getReviewId(), saga.getSfMemberOffset()));
+        } 
+        else if (saga.getSfBlockOffset() < saga.getTotalBlocks()) {
+             // Sync Next 200 Blocks
+             commandGateway.dispatch(new SyncBlocksCommand(saga.getReviewId(), saga.getSfBlockOffset()));
+        } 
+        else {
+             // FINISHED
+             saga.setStep(SagaStep.FINALIZING);
+             finalizeReview(saga);
+        }
+        
+        sagaRepo.save(saga);
+    }
+}
+```
+
+-----
+
+## 5\. Resilience & Error Scenarios Matrix
+
+| Scenario | System Behavior | Recovery Mechanism |
+| :--- | :--- | :--- |
+| **API Timeout (Single Member)** | Worker catches exception, sets status `ERROR`. | Saga detects error at end of batch, increments retry count, and re-dispatches ONLY this member. |
+| **Container Crash (During Gen)** | In-memory threads die. DB rows stay `PROCESSING` or `TO_DO`. | On restart, a Scheduled Task detects "stuck" `PROCESSING` rows \> 10min and resets them to `TO_DO`. |
+| **Salesforce Limit Reached** | Sync Loop fails one batch. | Saga cursor is NOT updated. Next retry resumes at the exact same batch. No data loss. |
+| **Event Registry Limit** | N/A | Prevented by using **Pull Pattern** (IDs fetched via Interface, not Event). |
+
+-----
+
+## 6\. Implementation Roadmap
+
+### Story 1: Foundation
+
+  * Create `ReviewSaga` and `MemberProcessStatus` entities.
+  * Implement the Internal API on Member Module (`getAllIds`).
+
+### Story 2: Block Generation with Tracking
+
+  * Implement `BlockOrchestrator` (Init `TO_DO`).
+  * Implement `BlockAsyncWorker` with `ThreadPoolTaskExecutor`.
+  * **Deliverable:** 400 rows in `MEMBER_PROCESS_STATUS` moving from `TO_DO` -\> `SUCCESS`.
+
+### Story 3: Saga Retry Logic
+
+  * Implement the completion check in Saga.
+  * Implement the logic: `if (errors > 0 && retry < 3) re-dispatch`.
+  * **Deliverable:** System automatically retries flaky API calls.
+
+### Story 4: Salesforce Loop
+
+  * Implement the Cursor-based sync.
+  * Ensure `SyncBlocksCommand` only selects blocks linked to members with `status=SUCCESS`.
+
+### Story 5: Finalization
+
+  * Update Status to `IN_PROGRESS`.
+  * Link Alert & Hit.
+
+-----
+
+## 7\. Retry Flow Diagram
+
+```mermaid
+sequenceDiagram
+    participant Saga
+    participant Orch as BlockOrchestrator
+    participant DB as StatusTable
+    participant Worker
+
+    Note over Saga: Phase: Generation
+    
+    Saga->>Orch: Command: GenerateBlocks
+    Orch->>DB: Insert 400 Rows [Status=TO_DO]
+    Orch->>Worker: Dispatch 400 Tasks
+    
+    par Parallel Workers
+        Worker->>DB: Update [PROCESSING]
+        Worker->>Worker: API Call
+        alt Failure
+            Worker->>DB: Update [ERROR]
+        else Success
+            Worker->>DB: Update [SUCCESS]
+        end
+        Worker-->>Saga: Event: AttemptFinished
+    end
+    
+    Note over Saga: All Workers Finished
+    
+    Saga->>DB: Count ERRORs (e.g., 5)
+    
+    alt Errors > 0 AND Retry < Max
+        Saga->>Orch: Re-Dispatch(ReviewId)
+        Orch->>DB: Select where Status=ERROR
+        Orch->>Worker: Dispatch 5 Tasks (Retry)
+    else No Errors
+        Saga->>Saga: Next Step: Sync Salesforce
+    end
+```
