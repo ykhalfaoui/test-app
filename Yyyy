@@ -1,0 +1,25 @@
+@Configuration
+public class TracingChallengerConfig {
+
+    @Bean
+    public TaskDecorator tracingTaskDecorator() {
+        return runnable -> {
+            // On capture le contexte du thread PARENT (Web)
+            ContextSnapshot snapshot = ContextSnapshotFactory.builder().build().captureAll();
+            return () -> {
+                // On restaure le contexte dans le thread ENFANT (Async)
+                try (ContextSnapshot.Scope scope = snapshot.setThreadLocals()) {
+                    runnable.run();
+                }
+            };
+        };
+    }
+
+    @Bean
+    public Executor taskExecutor(TaskExecutorBuilder builder, TaskDecorator tracingTaskDecorator) {
+        return builder
+                .threadNamePrefix("async-trace-")
+                .taskDecorator(tracingTaskDecorator) // C'est le lien vital
+                .build();
+    }
+}
