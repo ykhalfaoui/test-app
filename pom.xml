@@ -51,6 +51,13 @@
             <artifactId>flyway-core</artifactId>
         </dependency>
 
+        <!-- Micrometer context propagation — enables ContextPropagatingTaskDecorator
+             and ThreadLocalAccessor SPI for full context propagation across async boundaries -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>context-propagation</artifactId>
+        </dependency>
+
         <!-- Kafka — optional, activate only when a broker is configured -->
         <dependency>
             <groupId>org.springframework.kafka</groupId>
