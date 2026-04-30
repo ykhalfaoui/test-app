@@ -296,7 +296,183 @@ Key output sections to watch:
 
 ---
 
-## 9. Kubernetes-Specific Recommendations
+## 9. Prometheus Integration
+
+### 9.1 Dependencies (Maven)
+
+```xml
+<!-- pom.xml -->
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+<dependency>
+  <groupId>io.micrometer</groupId>
+  <artifactId>micrometer-registry-prometheus</artifactId>
+  <scope>runtime</scope>
+</dependency>
+```
+
+### 9.2 Spring Boot configuration
+
+```yaml
+# application.yml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    prometheus:
+      enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+      environment: ${spring.profiles.active:default}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        jvm.gc.pause: true
+      percentiles:
+        http.server.requests: 0.5,0.90,0.95,0.99
+        jvm.gc.pause: 0.5,0.90,0.99
+    enable:
+      jvm: true
+      process: true
+      system: true
+      hikaricp: true        # connection pool metrics if using HikariCP
+```
+
+L'endpoint Prometheus est alors accessible sur : `GET /actuator/prometheus`
+
+### 9.3 Métriques JVM clés exposées
+
+| Métrique Prometheus | Description |
+|---|---|
+| `jvm_memory_used_bytes{area="heap"}` | Heap utilisé |
+| `jvm_memory_max_bytes{area="heap"}` | Heap maximum |
+| `jvm_memory_used_bytes{area="nonheap"}` | Metaspace + Code cache |
+| `jvm_gc_pause_seconds_*` | Durée des pauses GC (count, sum, max, percentiles) |
+| `jvm_gc_memory_promoted_bytes_total` | Promotions Old Gen |
+| `jvm_gc_memory_allocated_bytes_total` | Allocations Young Gen |
+| `jvm_threads_live_threads` | Threads actifs |
+| `jvm_threads_daemon_threads` | Threads daemon |
+| `process_cpu_usage` | CPU du process JVM |
+| `process_memory_rss_bytes` | RSS total du process (non-heap inclus) |
+
+### 9.4 Scrape config Prometheus
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: spring-boot-app
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - app:8080   # nom du service Docker / K8s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+```
+
+### 9.5 Kubernetes — annotations de scrape automatique
+
+Ajouter ces annotations sur le `Pod` ou le `Deployment` pour que l'opérateur Prometheus (kube-prometheus-stack) découvre automatiquement l'application :
+
+```yaml
+# deployment.yaml
+spec:
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/actuator/prometheus"
+        prometheus.io/port: "8080"
+```
+
+Ou via un `ServiceMonitor` si kube-prometheus-stack est installé :
+
+```yaml
+# service-monitor.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: spring-boot-app
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app: spring-boot-app
+  endpoints:
+    - port: http
+      path: /actuator/prometheus
+      interval: 15s
+```
+
+### 9.6 Alertes Prometheus recommandées
+
+```yaml
+# alerts.yml
+groups:
+  - name: jvm-memory
+    rules:
+      - alert: HeapUsageHigh
+        expr: |
+          jvm_memory_used_bytes{area="heap"}
+          / jvm_memory_max_bytes{area="heap"} > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Heap > 85 % sur {{ $labels.instance }}"
+
+      - alert: HeapUsageCritical
+        expr: |
+          jvm_memory_used_bytes{area="heap"}
+          / jvm_memory_max_bytes{area="heap"} > 0.95
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Heap > 95 % — risque OOM sur {{ $labels.instance }}"
+
+      - alert: GCPauseHigh
+        expr: |
+          rate(jvm_gc_pause_seconds_sum[5m])
+          / rate(jvm_gc_pause_seconds_count[5m]) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pause GC moyenne > 500 ms sur {{ $labels.instance }}"
+
+      - alert: MetaspaceUsageHigh
+        expr: |
+          jvm_memory_used_bytes{id="Metaspace"}
+          / jvm_memory_max_bytes{id="Metaspace"} > 0.90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Metaspace > 90 % sur {{ $labels.instance }}"
+```
+
+### 9.7 Dashboards Grafana
+
+Importer les dashboards communautaires suivants (via l'ID Grafana) :
+
+| Dashboard | ID | Description |
+|---|---|---|
+| JVM Micrometer | **4701** | Heap, GC, threads, CPU |
+| Spring Boot Statistics | **6756** | HTTP, hikari, logback |
+| JVM Overview (G1GC) | **11955** | Détail G1GC regions |
+
+---
+
+## 10. Kubernetes-Specific Recommendations
 
 ```yaml
 # values.yaml / deployment patch
@@ -336,7 +512,11 @@ Use `JAVA_TOOL_OPTIONS` (not `JAVA_OPTS`) in Kubernetes — it is read by all JV
 - [ ] `MaxRAMPercentage` used instead of hard-coded `-Xmx`
 - [ ] `MaxMetaspaceSize` explicitly capped
 - [ ] GC logging enabled in staging/production
-- [ ] Actuator metrics endpoint exposed (Prometheus scrape)
+- [ ] Dépendance `micrometer-registry-prometheus` présente dans `pom.xml`
+- [ ] Endpoint `/actuator/prometheus` exposé et accessible
+- [ ] Annotations de scrape ou `ServiceMonitor` configurés
+- [ ] Alertes `HeapUsageHigh` et `GCPauseHigh` actives
+- [ ] Dashboard Grafana ID 4701 importé
 - [ ] `ExitOnOutOfMemoryError` enabled to trigger pod restart
 - [ ] `HeapDumpOnOutOfMemoryError` with persistent volume for dump path
 - [ ] NMT enabled in staging for baseline RSS measurement
