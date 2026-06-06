@@ -1,0 +1,64 @@
+Je comprends, toutes mes excuses. Voici le contenu complet structuré que vous pouvez copier-coller directement dans vos propres fichiers.
+## 1. Guide Expert : Recommandations JVM & OpenShift
+*(Contenu du fichier Markdown)*
+### Stratégie de Configuration Java 17
+Sur OpenShift, n'utilisez pas de valeurs fixes (ex: -Xmx512m). Utilisez les pourcentages pour laisser la JVM s'adapter dynamiquement aux limites du pod.
+**Variables d'environnement recommandées (JAVA_TOOL_OPTIONS) :**
+ * -XX:MaxRAMPercentage=75.0 : Laisse 25% de la mémoire du container pour le "Non-Heap" (Threads, Metaspace, OS).
+ * -XX:InitialRAMPercentage=50.0 : Pour éviter des lenteurs au démarrage.
+ * -XX:MaxMetaspaceSize=256M : Sécurité indispensable pour éviter que le Metaspace ne consomme toute la RAM du worker node.
+ * -XX:+ExitOnOutOfMemoryError : Force le Pod à redémarrer proprement en cas de crash mémoire.
+ * -XX:NativeMemoryTracking=summary : Permet d'utiliser jcmd pour l'analyse.
+### Procédure d'Analyse Rapide (Commandes CLI)
+ 1. **Entrer dans le Pod :** oc exec -it <nom_du_pod> -- /bin/bash
+ 2. **État de santé GC :** jstat -gcutil 1 1000 5 (Vérifiez la colonne FGC).
+ 3. **Top 20 des objets :** jcmd 1 GC.class_histogram | head -n 20
+ 4. **Analyse Native (Hors-Heap) :** jcmd 1 VM.native_memory summary
+## 2. Outil d'Analyse de Données (Tableau de Calcul)
+*(Vous pouvez copier ce tableau dans Excel ou Google Sheets)*
+| Catégorie Mémoire | Valeur jcmd (MB) | Limite Container (MB) | Ratio / Limite % | Seuil Critique |
+|---|---|---|---|---|
+| **Java Heap** | *Saisir ici* | 1024 | =B2/C2 | > 80% |
+| **Metaspace** | *Saisir ici* | 1024 | =B3/C3 | > 15% |
+| **Threads (Stack)** | *Saisir ici* | 1024 | =B4/C4 | > 10% |
+| **Code Cache** | *Saisir ici* | 1024 | =B5/C5 | > 5% |
+| **Direct Buffers** | *Saisir ici* | 1024 | =B6/C6 | > 5% |
+| **TOTAL (Committed)** | =SOMME(B2:B6) | 1024 | =B7/C7 | **> 90% (DANGER)** |
+**Formule pour convertir les KB de jcmd en MB :** =Valeur_KB / 1024
+## 3. Configuration Spring Boot 3 + Prometheus
+*(Instructions techniques)*
+### Étape 1 : Dépendance Maven
+Ajoutez ceci dans votre pom.xml pour transformer les métriques en format Prometheus :
+```xml
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-registry-prometheus</artifactId>
+    <scope>runtime</scope>
+</dependency>
+
+```
+### Étape 2 : Activation dans application.properties
+```properties
+# Exposer l'endpoint Prometheus
+management.endpoints.web.exposure.include=health,info,prometheus,metrics
+management.endpoint.prometheus.enabled=true
+# Optionnel : détails pour le diagnostic
+management.endpoint.health.show-details=always
+
+```
+### Étape 3 : Annotation du Service OpenShift
+Pour que le Prometheus intégré à OpenShift trouve votre application, ajoutez ces annotations sur votre **Service** (YAML) :
+```yaml
+metadata:
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/actuator/prometheus"
+    prometheus.io/port: "8080"
+
+```
+## 4. Pourquoi votre application plante sans atteindre 100% ?
+Voici les 3 causes expertes à vérifier dans vos logs :
+ 1. **Fragmentation G1GC :** Si vous avez des "Humongous Objects" (plus gros que 50% d'une région G1), la JVM peut lancer un OutOfMemoryError alors qu'il reste 30% de place totale.
+ 2. **Saturation du Metaspace :** Si vous avez mis -XX:MaxMetaspaceSize=128M et que votre application Spring Boot (très gourmande en classes) dépasse cette limite, elle plantera, même si le Heap est vide.
+ 3. **Saturation des Threads :** Si vous montez à plus de 500 threads, la mémoire "Native" du container peut être saturée avant que le tas Java ne soit plein.
+Avez-vous réussi à obtenir le résultat de la commande jcmd 1 VM.native_memory summary sur votre Pod ? Je peux vous aider à interpréter les chiffres si vous les collez ici.
