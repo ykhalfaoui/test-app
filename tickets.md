@@ -19,13 +19,13 @@ Low-risk retail customers are processed automatically (straight-through processi
 
 **Reference:** `kyc-review-cases.drawio` (Blueprint, How to read, Cases index, Case 1 to 14, Business questions D1 to D7 and Q1 to Q12).
 
-**Already in place:** per-member i-Hub document check, transactional outbox.
+**Already in place:** i-Hub document update service per party (FTKYP-646, FTKYP-643), transactional outbox.
 
 ## Ticket overview
 
 | # | Ticket | Depends on | Open questions |
 |---|---|---|---|
-| 1 | Review Enricher: i-Hub documents into `ReviewEvaluation` | none | none |
+| 1 | Review Enricher: refresh and consolidate the i-Hub documents of a review | none | none |
 | 2 | Review Enricher: non i-Hub blocks, KYC data / KYT, profile, unblock state | 1 | none |
 | 3 | Typed task event through the outbox (`KycReviewTaskRequested` + `TaskType`) | none | Q1 to Q4 |
 | 4 | Rule FR 0.0: i-Hub documents completed | 2, 3 | none |
@@ -39,29 +39,53 @@ Tickets 1 and 3 can start in parallel on day one.
 
 ---
 
-## Ticket 1 - Review Enricher: i-Hub documents into `ReviewEvaluation`
+## Ticket 1 - Review Enricher: refresh and consolidate the i-Hub documents of a review
 
 **Type:** Technical story
+**Reuses:** FTKYP-646 (i-Hub document update service per party), FTKYP-643 (iHub adapter `GET /v1/bil-parties/{partyId}/completeness-status`)
 
 ### Business context
-For each review, KYCO today opens every member (main party and related parties) and checks in i-Hub whether the requested documents are received and validated. A review can only move forward when **all** documents of **all** members are valid. Three situations block the progress:
-- a document is **pending**: the customer provided it and the back office is validating it. Blocking must be paused while it is pending (decision D2).
-- a document is **rejected**: the back office refused it. Automatic blocking is not allowed, KYCO must look at it (case 8).
-- a document is **missing or not valid yet**.
+During a periodic review, the customer and its related parties send documents through i-Hub. The i-Hub back office validates them. Today KYCO opens every member of the review and checks in i-Hub where each document stands. The review can only move forward when **all** i-Hub document blocks of **all** members are compliant (validated by system or by user).
 
-KYCO also needs to know **when** a block has just become valid, to be told that the i-Hub part is complete (rule FR 0.0). This is an event in time, not a state.
+Three situations matter for the business rules:
+- a document is **pending**: the customer provided it and the back office is validating it. Blocking is paused while it is pending (decision D2, case 7).
+- a document is **rejected**: the back office refused it. Automatic blocking is not allowed, KYCO must look at it (case 8).
+- a block **has just been validated**: KYCO must be told that the i-Hub part is now complete (rule FR 0.0, case 3). This is an event of the current execution, not a state.
 
 ### Technical description
-The Review Enricher takes **one review** as input and returns a `ReviewEvaluation`, the single object read by all rules. This ticket covers the document part. It **reuses the existing per-member document check** and only consolidates its results at review level. Review selection is out of scope (ticket 9).
+FTKYP-646 already refreshes the i-Hub documents of **one party**: it calls i-Hub, updates the document statuses and the review blocks, and returns four indicators. This ticket calls it for **every active member of a review** and consolidates the four indicators at review level into `ReviewEvaluation`. No document logic is reimplemented here.
 
-### Scope
-1. **Load the members of the review**
-   - Main party and related parties.
-   - Exclude members with status `removed`.
-2. **Call the existing per-member i-Hub document check**
-   - Only blocks that impact the review: specific blocks of the member and common blocks.
-   - The existing check returns, per member: all documents valid, pending document, rejected document.
+Review selection and scheduling are out of scope (ticket 9): the input of this ticket is one review id.
+
+### Processing
+1. **Load the review members**
+   - Main party and related parties of the review.
+   - Keep members with status **different from `removed`**.
+   - Keep only members that have at least one i-Hub document block on the review (`DOCS_IHUB_COMMON` or `DOCS_IHUB_SPECIFIC`).
+2. **Call FTKYP-646 for each member**
+   - Input: `partyId` and the list of i-Hub block types the member has on the review.
+   - FTKYP-646 updates documents and blocks (all documents `IN_GOOD_ORDER` moves the block to `VALIDATED_BY_SYSTEM`, otherwise the block keeps its status). Locked or finalized blocks are not updated.
+   - Output per member:
+
+```json
+{
+  "newValidation": true,
+  "allBlocksCompliant": false,
+  "rejected": true,
+  "pending": true
+}
+```
+
 3. **Consolidate at review level**
+
+| Review indicator | Rule | Meaning |
+|---|---|---|
+| `newValidation` | OR of all members | at least one block of the review was validated during this execution |
+| `allBlocksCompliant` | AND of all members | every i-Hub block of every member is validated (by system or by user) |
+| `pending` | OR of all members | at least one document under back-office validation |
+| `rejected` | OR of all members | at least one document rejected |
+
+4. **Expose the result in `ReviewEvaluation`**
 
 ```java
 public record ReviewEvaluation(
@@ -73,54 +97,52 @@ public record ReviewEvaluation(
 ) {}
 
 public record ReviewDocumentResult(
-    boolean allDocumentsValid,   // every document of every active member is valid
-    boolean pendingDocument,     // at least one document under back-office validation
-    boolean rejectedDocument,    // at least one document rejected
-    boolean blockJustValidated   // at least one block became valid since the previous evaluation
+    boolean newValidation,
+    boolean allBlocksCompliant,
+    boolean pending,
+    boolean rejected
 ) {}
 ```
 
-4. **Compute `blockJustValidated`**
-   - Persist, per review and per i-Hub block, the last known validation state.
-   - `blockJustValidated = true` when at least one block was not valid at the previous evaluation and is valid now.
-   - Update the stored state at the end of the evaluation, in the same transaction.
-   - Storage proposal: table `review_ihub_block_state (review_id, block_id, valid, evaluated_at)`. To agree within the team.
+### Examples (review with two members)
 
-### Consolidation rules
-
-| Member results | `allDocumentsValid` | `pendingDocument` | `rejectedDocument` |
-|---|---|---|---|
-| All members all valid | true | false | false |
-| At least one pending | false | true | depends |
-| At least one rejected | false | depends | true |
-| Missing or not valid, nothing pending or rejected | false | false | false |
-
-`pendingDocument` and `rejectedDocument` can both be true on the same review (two different documents).
+| Member A | Member B | `newValidation` | `allBlocksCompliant` | `pending` | `rejected` |
+|---|---|---|---|---|---|
+| block just validated, compliant | already compliant | true | true | false | false |
+| already compliant | already compliant | false | true | false | false |
+| block just validated, compliant | one document pending | true | false | true | false |
+| one document rejected | one document pending | false | false | true | true |
+| no change, not compliant | already compliant | false | false | false | false |
 
 ### Edge cases
-- Review with no active member: log a warning, return `allDocumentsValid = false`, no exception.
-- Member with no i-Hub block impacting the review: ignored for the consolidation.
-- First evaluation of a review (no stored state): `blockJustValidated = true` only for blocks already valid. To confirm within the team, otherwise `false` on the first run.
-- The existing check fails for one member: the whole review evaluation fails, error logged with review id and member id. The caller decides whether to continue (ticket 8).
+- **No eligible member** (all removed or no i-Hub block): `allBlocksCompliant = true`, all other indicators false, warning logged. To confirm within the team: a review without i-Hub block is compliant on the i-Hub side.
+- **FTKYP-646 fails for one member** (iHub adapter down, timeout): the review evaluation stops, error logged with review id and party id, no rule is applied for this review in this execution.
+- **Loss of `newValidation`**: FTKYP-646 persists its updates immediately. If member A gets `newValidation = true` and the evaluation then fails on member B, the next execution sees no change on A and FR 0.0 is never triggered. Options to agree within the team:
+  - run the refresh and the rules in the same transaction, so a failure rolls back the document updates too,
+  - or persist a "validation not yet evaluated" flag per review, cleared once the rules have run.
+- **Locked or finalized blocks**: not updated by FTKYP-646, their current compliance is taken as is.
 
 ### Out of scope
-- Per-member document check (existing).
+- Document update logic, i-Hub call and block transition (FTKYP-646, FTKYP-643).
 - Non i-Hub blocks, KYC data / KYT, profile (ticket 2).
 - Review selection and scheduling (ticket 9).
 
 ### Acceptance criteria
-- Given a review whose members all have valid documents, when the enricher runs, then `allDocumentsValid = true`, `pendingDocument = false`, `rejectedDocument = false`.
-- Given one pending document on a related party, then `pendingDocument = true` and `allDocumentsValid = false`.
-- Given one rejected document, then `rejectedDocument = true` and `allDocumentsValid = false`.
-- Given a member with status `removed` with an invalid document, then it is ignored and `allDocumentsValid` reflects only active members.
-- Given a block not valid at evaluation N and valid at evaluation N+1, then `blockJustValidated = true` at N+1 and `false` at N+2 if nothing changed.
-- Given no change between two evaluations, then `blockJustValidated = false`.
-- Given the existing check fails, then the error is logged with review id and member id and no partial state is stored.
+- Given a review with a `removed` member, when the enricher runs, then FTKYP-646 is not called for that member.
+- Given a member with no i-Hub block on the review, then FTKYP-646 is not called for that member.
+- Given a member with only `DOCS_IHUB_SPECIFIC`, then FTKYP-646 is called with that block type only.
+- Given two members both compliant after the call, then `allBlocksCompliant = true`.
+- Given one member not compliant, then `allBlocksCompliant = false`.
+- Given one member with `newValidation = true`, then the review `newValidation = true`.
+- Given one member with `pending = true`, then the review `pending = true`.
+- Given one member with `rejected = true`, then the review `rejected = true`.
+- Given FTKYP-646 fails for one member, then the error is logged with review id and party id and no rule runs for this review.
+- Given the examples table above, then every line returns the expected indicators.
 
 ### Tests
-- Unit tests on the consolidation table above.
-- Integration test on `blockJustValidated` over three successive evaluations.
-- Draw.io cases covered: 3, 6, 7, 8, 9 (document part).
+- Unit tests on the consolidation (OR / AND) with FTKYP-646 mocked, one test per line of the examples table.
+- Integration test: review with a removed member and a member without i-Hub block.
+- Draw.io cases covered (document part): 3, 6, 7, 8, 9.
 
 ---
 
@@ -285,8 +307,8 @@ This rule never changes the review, it only informs KYCO. It has **no condition 
 ```
 eligible if
     status in (CCO, PREPARE_COM, BLOCKED)
-    and documents.allDocumentsValid
-    and documents.blockJustValidated
+    and documents.allBlocksCompliant
+    and documents.newValidation
     and not nonIhubBlocksOk
 then
     publish KycReviewTaskRequested(FR_0_0)
@@ -342,10 +364,10 @@ The customer had until the **blocking planned date** to provide what was asked. 
 eligible if
     status in (CCO, PREPARE_COM)
     and blockingPlannedDate < today
-    and not documents.pendingDocument
-    and (not documents.allDocumentsValid or not kycDataAndKytOk)
+    and not documents.pending
+    and (not documents.allBlocksCompliant or not kycDataAndKytOk)
 then
-    if profile.autoBlockingAllowed() and not documents.rejectedDocument
+    if profile.autoBlockingAllowed() and not documents.rejected
         AutomaticAction(BLOCK_REVIEW)        -> status BLOCKED
     else
         TaskRequested(FR_0_A)
@@ -394,7 +416,7 @@ FR 0.B **only unblocks the account**. The review stays `Blocked`: finalizing it 
 ```
 eligible if
     status = BLOCKED
-    and documents.allDocumentsValid
+    and documents.allBlocksCompliant
     and nonIhubBlocksOk
     and unblockAction != PROCESSED
     [and kycDataAndKytOk  -> to confirm, Q12]
@@ -446,7 +468,7 @@ A review is ready to close when every document is valid and every non i-Hub bloc
 
 ```
 eligible if
-    documents.allDocumentsValid
+    documents.allBlocksCompliant
     and nonIhubBlocksOk
     [and kycDataAndKytOk  -> to confirm, Q12]
     and (
